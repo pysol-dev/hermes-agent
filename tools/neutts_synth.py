@@ -85,6 +85,15 @@ def main():
         codec_device=args.device,
     )
     ref_codes = tts.encode_reference(str(ref_audio))
+
+    # NeuTTS' optional Perth watermarking can crash on very short generations
+    # (for example, short voice-chat replies) because Perth's STFT padding is
+    # larger than the generated waveform.  The watermark is not needed for local
+    # live TTS, so disable it before inference instead of letting otherwise-valid
+    # speech fail with: "Padding size should be less than ... input [1, 1, 640]".
+    if getattr(tts, "watermarker", None) is not None:
+        tts.watermarker = None
+
     wav = tts.infer(args.text, ref_codes, ref_text)
 
     # Write output

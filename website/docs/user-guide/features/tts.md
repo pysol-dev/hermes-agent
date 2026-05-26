@@ -10,7 +10,7 @@ Hermes Agent supports both text-to-speech output and voice message transcription
 
 ## Text-to-Speech
 
-Convert text to speech with six providers:
+Convert text to speech with seven providers:
 
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------|
@@ -20,6 +20,7 @@ Convert text to speech with six providers:
 | **MiniMax TTS** | Excellent | Paid | `MINIMAX_API_KEY` |
 | **Mistral (Voxtral TTS)** | Excellent | Paid | `MISTRAL_API_KEY` |
 | **NeuTTS** | Good | Free | None needed |
+| **Local HTTP** | Depends on local engine | Free/local | Optional `LOCAL_TTS_API_KEY` |
 
 ### Platform Delivery
 
@@ -35,7 +36,7 @@ Convert text to speech with six providers:
 ```yaml
 # In ~/.hermes/config.yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "neutts"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "neutts" | "local_http"
   speed: 1.0                    # Global speed multiplier (provider-specific settings override this)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
@@ -62,6 +63,15 @@ tts:
     ref_text: ''
     model: neuphonic/neutts-air-q4-gguf
     device: cpu
+  local_http:
+    base_url: "http://127.0.0.1:8020/v1"  # Uses POST <base_url>/audio/speech
+    endpoint: ""                          # Optional full endpoint override
+    model: "local-tts"
+    voice: "default"
+    timeout: 60
+    api_key: ""                           # Optional; LOCAL_TTS_API_KEY also supported
+    response_format: ""                   # Optional override: mp3, opus, wav, flac
+    extra_body: {}                         # Engine-specific JSON fields
 ```
 
 **Speed control**: The global `tts.speed` value applies to all providers by default. Each provider can override it with its own `speed` setting (e.g., `tts.openai.speed: 1.5`). Provider-specific speed takes precedence over the global value. Default is `1.0` (normal speed).
@@ -86,11 +96,49 @@ brew install ffmpeg
 sudo dnf install ffmpeg
 ```
 
-Without ffmpeg, Edge TTS, MiniMax TTS, and NeuTTS audio are sent as regular audio files (playable, but shown as a rectangular player instead of a voice bubble).
+Without ffmpeg, Edge TTS, MiniMax TTS, and NeuTTS audio are sent as regular audio files (playable, but shown as a rectangular player instead of a voice bubble). Local HTTP can produce Opus natively if your local server supports `response_format: opus`; otherwise use ffmpeg or MP3.
 
 :::tip
 If you want voice bubbles without installing ffmpeg, switch to the OpenAI, ElevenLabs, or Mistral provider.
 :::
+
+### Local HTTP TTS Provider
+
+`local_http` lets Hermes delegate synthesis to any local or LAN service that exposes an OpenAI-compatible text-to-speech endpoint. This is useful for optional heavyweight engines such as Coqui/XTTS, Piper, VibeVoice, StyleTTS, or a custom voice-cloning stack without embedding those dependencies into the Hermes gateway process.
+
+Hermes sends:
+
+```http
+POST /v1/audio/speech
+Content-Type: application/json
+Accept: audio/*
+```
+
+```json
+{
+  "model": "local-tts",
+  "input": "Text to speak",
+  "voice": "default",
+  "response_format": "mp3"
+}
+```
+
+The server should return raw audio bytes. Hermes chooses `response_format` from the output extension (`mp3`, `opus`, `wav`, or `flac`) unless `tts.local_http.response_format` is set. Any keys in `tts.local_http.extra_body` are merged into the request, so engine-specific options such as `language`, `speaker_wav`, or `temperature` can be passed without changing Hermes.
+
+Example configuration for a local XTTS/Coqui wrapper:
+
+```yaml
+tts:
+  provider: local_http
+  local_http:
+    base_url: "http://127.0.0.1:8020/v1"
+    model: "xtts-v2"
+    voice: "peach"
+    timeout: 120
+    extra_body:
+      language: "en"
+      speaker_wav: "/home/me/.hermes/voice_refs/peach/peach_ref.wav"
+```
 
 ## Voice Message Transcription (STT)
 
