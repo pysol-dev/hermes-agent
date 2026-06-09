@@ -184,10 +184,23 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(
+        self,
+        voice_client,
+        allowed_user_ids: Optional[set] = None,
+        *,
+        silence_threshold: Optional[float] = None,
+        min_speech_duration: Optional[float] = None,
+    ):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
+        self._silence_threshold = self._coerce_duration(
+            silence_threshold, self.SILENCE_THRESHOLD, minimum=0.3, maximum=5.0,
+        )
+        self._min_speech_duration = self._coerce_duration(
+            min_speech_duration, self.MIN_SPEECH_DURATION, minimum=0.1, maximum=5.0,
+        )
 
         # Decryption
         self._secret_key: Optional[bytes] = None
@@ -210,6 +223,31 @@ class VoiceReceiver:
 
         # Debug logging counter (instance-level to avoid cross-instance races)
         self._packet_debug_count = 0
+
+    # ------------------------------------------------------------------
+    # Config parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _coerce_duration(
+        value: Optional[float],
+        default: float,
+        *,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        """Return a bounded duration value for voice detection settings."""
+        if value is None:
+            return float(default)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if parsed < minimum:
+            return float(minimum)
+        if parsed > maximum:
+            return float(maximum)
+        return parsed
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -478,7 +516,7 @@ class VoiceReceiver:
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
 
-                if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
+                if silence_duration >= self._silence_threshold and buf_duration >= self._min_speech_duration:
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         # SSRC not mapped (SPEAKING event missing after bot rejoin).
@@ -488,7 +526,7 @@ class VoiceReceiver:
                         completed.append((user_id, bytes(buf)))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
-                elif silence_duration >= self.SILENCE_THRESHOLD * 2:
+                elif silence_duration >= self._silence_threshold * 2:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
@@ -606,6 +644,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
+        self._voice_listen_cfg: Dict[str, Any] = self._load_voice_listen_config()
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
@@ -1931,6 +1970,29 @@ class DiscordAdapter(BasePlatformAdapter):
     # Voice channel methods (join / leave / play)
     # ------------------------------------------------------------------
 
+    def _load_voice_listen_config(self) -> Dict[str, Any]:
+        """Read Discord voice-listening latency knobs from config.yaml.
+
+        Settings live under ``discord.voice_listen``.  Defaults preserve the
+        historical behavior; users who prefer lower latency can reduce the
+        silence threshold at the risk of clipping long pauses.
+        """
+        defaults: Dict[str, Any] = {
+            "silence_threshold": VoiceReceiver.SILENCE_THRESHOLD,
+            "min_speech_duration": VoiceReceiver.MIN_SPEECH_DURATION,
+        }
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            listen = ((cfg.get("discord") or {}).get("voice_listen") or {})
+            if isinstance(listen, dict):
+                for k, v in listen.items():
+                    if k in defaults and v is not None:
+                        defaults[k] = v
+        except Exception as e:
+            logger.debug("Could not load discord.voice_listen config: %s", e)
+        return defaults
+
     def _load_voice_fx_config(self) -> Dict[str, Any]:
         """Read voice mixer / ambient / ack settings from config.yaml.
 
@@ -2108,7 +2170,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Start voice receiver (Phase 2: listen to users)
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                receiver = VoiceReceiver(
+                    vc,
+                    allowed_user_ids=self._allowed_user_ids,
+                    silence_threshold=self._voice_listen_cfg.get("silence_threshold"),
+                    min_speech_duration=self._voice_listen_cfg.get("min_speech_duration"),
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
