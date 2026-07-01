@@ -17,6 +17,20 @@ from gateway.platforms.base import (
 )
 
 
+class _TtsTextAdapter(BasePlatformAdapter):
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, *args, **kwargs):
+        raise NotImplementedError
+
+    async def get_chat_info(self, chat_id):
+        return {}
+
+
 class TestSecretCaptureGuidance:
     def test_gateway_secret_capture_message_points_to_local_setup(self):
         message = GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE
@@ -47,6 +61,34 @@ class TestSafeUrlForLog:
         assert safe_url_for_log(url, max_len=3) == "..."
         assert safe_url_for_log(url, max_len=2) == ".."
         assert safe_url_for_log(url, max_len=0) == ""
+
+
+class TestPrepareTtsText:
+    def test_sanitizes_discord_final_response_before_markdown_stripping(self):
+        response = """Done — generated the Hayden references:
+
+```bash
+python tools/voice_clone_workspace.py --ref ~/.hermes/voice_refs/drhayden/multi/source_mono_24k.wav
+```
+
+Saved `/home/lock/.hermes/audio_cache/audio_27edf2b42060.ogg` and dr_hayden_ref_01.wav.
+"""
+
+        adapter = object.__new__(_TtsTextAdapter)
+        spoken = adapter.prepare_tts_text(response)
+
+        assert "code block" in spoken
+        assert "a file path" in spoken
+        assert "an audio file" in spoken
+        for raw in (
+            "~/.hermes/voice_refs/drhayden/multi/source_mono_24k.wav",
+            "/home/lock/.hermes/audio_cache/audio_27edf2b42060.ogg",
+            "source_mono_24k.wav",
+            "dr_hayden_ref_01.wav",
+            "audio_27edf2b42060.ogg",
+            "python tools/voice_clone_workspace.py",
+        ):
+            assert raw not in spoken
 
 
 # ---------------------------------------------------------------------------

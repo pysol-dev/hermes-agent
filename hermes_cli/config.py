@@ -976,7 +976,7 @@ DEFAULT_CONFIG = {
         # unblocks with "[user did not respond within Xm]" so it can adapt
         # rather than pinning the running-agent guard forever.  CLI clarify
         # blocks indefinitely (input() is synchronous) and ignores this.
-        "clarify_timeout": 600,
+        "clarify_timeout": 120,
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
@@ -1773,9 +1773,9 @@ DEFAULT_CONFIG = {
     # Each provider supports an optional `max_text_length:` override for the
     # per-request input-character cap. Omit it to use the provider's documented
     # limit (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k model-aware,
-    # Gemini 32000, Edge 5000, Mistral 4000, NeuTTS/KittenTTS 2000).
+    # Gemini 32000, Edge/local_http/Piper 5000, Mistral 4000, NeuTTS/KittenTTS 2000).
     "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "gemini" | "neutts" (local) | "kittentts" (local) | "piper" (local)
+        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "gemini" | "neutts" (local) | "kittentts" (local) | "piper" (local) | "local_http" (local sidecar)
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
@@ -1830,6 +1830,18 @@ DEFAULT_CONFIG = {
             # "noise_w_scale": 0.8,
             # "volume": 1.0,
             # "normalize_audio": True,
+        },
+        "local_http": {
+            # Generic OpenAI-compatible local/LAN TTS sidecar.
+            # POSTs raw-audio requests to <base_url>/audio/speech by default.
+            "base_url": "http://127.0.0.1:8020/v1",
+            "endpoint": "",
+            "model": "local-tts",
+            "voice": "default",
+            "timeout": 60,
+            "api_key": "",
+            "response_format": "",
+            "extra_body": {},
         },
     },
     
@@ -2141,6 +2153,25 @@ DEFAULT_CONFIG = {
                 "Give me a sec.",
                 "On it.",
             ],
+        },
+        # Discord voice-channel inactivity policy. timeout_seconds is the
+        # auto-leave delay after VC activity; set 0 to disable idle auto-leave.
+        # disconnect_while_busy preserves historical behavior when true. Set
+        # false to keep Hermes joined while an agent run for the linked text
+        # channel is in flight, then re-check when the run ends.
+        "voice_timeout": {
+            "timeout_seconds": 300,
+            "disconnect_while_busy": True,
+        },
+        # Optional busy audio bed for Discord VC. When enabled and path points
+        # at any ffmpeg-decodable audio file, Hermes loops it while an agent task
+        # is running for the linked text channel. TTS replies still play over the
+        # bed and duck it. Uses the mixer but does not require voice_fx.enabled.
+        "voice_busy": {
+            "enabled": False,
+            "path": "",
+            "gain": 0.18,
+            "duck_gain": 0.06,
         },
     },
 

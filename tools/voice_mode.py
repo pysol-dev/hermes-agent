@@ -834,6 +834,8 @@ WHISPER_HALLUCINATIONS = {
     "please subscribe",
     "thank you for watching.",
     "thank you for watching",
+    "thank you so much for watching, and i'll see you in the next video!",
+    "thank you so much for watching and i'll see you in the next video",
     "bye.",
     "bye",
     "you",
@@ -853,9 +855,10 @@ WHISPER_HALLUCINATIONS = {
 
 # Regex patterns for repetitive hallucinations (e.g. "Thank you. Thank you. Thank you.")
 _HALLUCINATION_REPEAT_RE = re.compile(
-    r'^(?:thank you|thanks|bye|you|ok|okay|the end|\.|\s|,|!)+$',
+    r'^(?:thank you|thanks|no problem|bye|you|yeah|ok|okay|the end|\.|\s|,|!)+$',
     flags=re.IGNORECASE,
 )
+_GEORGIAN_REPEAT_RE = re.compile(r'^\s*([\u10A0-\u10FF\u2D00-\u2D2F])(?:\s*\1)+\s*$')
 
 
 def is_whisper_hallucination(transcript: str) -> bool:
@@ -868,6 +871,10 @@ def is_whisper_hallucination(transcript: str) -> bool:
         return True
     # Repetitive patterns (e.g. "Thank you. Thank you. Thank you. you")
     if _HALLUCINATION_REPEAT_RE.match(cleaned):
+        return True
+    # Faster-whisper can hallucinate repeated Georgian letters on Discord VC
+    # background noise / near-silence when language auto-detect guesses wrong.
+    if _GEORGIAN_REPEAT_RE.match(transcript.strip()):
         return True
     return False
 

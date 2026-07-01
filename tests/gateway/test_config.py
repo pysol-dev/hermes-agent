@@ -311,6 +311,29 @@ class TestLoadGatewayConfig:
 
         assert config.quick_commands == {"limits": {"type": "exec", "command": "echo ok"}}
 
+    def test_bridges_discord_voice_listen_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  enabled: true\n"
+            "  voice_listen:\n"
+            "    followup_window_seconds: 7\n"
+            "    min_followup_words: 4\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+
+        config = load_gateway_config()
+
+        discord = config.platforms[Platform.DISCORD]
+        assert discord.extra["voice_listen"] == {
+            "followup_window_seconds": 7,
+            "min_followup_words": 4,
+        }
+
     def test_relay_platform_enabled_from_env_url(self, tmp_path, monkeypatch):
         """GATEWAY_RELAY_URL must enable Platform.RELAY in config.platforms so
         start_gateway()'s connect loop actually dials the connector. Registering
