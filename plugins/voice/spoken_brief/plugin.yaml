@@ -1,0 +1,6 @@
+name: spoken-brief
+version: 0.1.0
+description: "Deterministic voice middleware: short, speakable TTS briefs while preserving full text replies."
+author: "NousResearch"
+hooks:
+  - transform_tts_text
