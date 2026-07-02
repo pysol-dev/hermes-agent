@@ -2716,6 +2716,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        self._busy_voice_guilds: Dict[int, int] = {}  # guild_id -> nested active task count
         self._active_session_leases: Dict[str, Any] = {}
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         # Last successfully-resolved (non-empty) model, keyed by session. Used
@@ -9113,6 +9114,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
 
+        if not command:
+            _text_l = (event.text or "").lower()
+            _clone_intent = bool(re.search(
+                r"\b(clone|copy|make|create|build|generate)\b.{0,40}\b(voice|speaker)\b|"
+                r"\b(voice|speaker)\b.{0,40}\b(clone|cloned|copy|copied)\b",
+                _text_l,
+            ))
+            _has_audio_for_clone = False
+            for _i, _path in enumerate(getattr(event, "media_urls", None) or []):
+                _mtype = event.media_types[_i] if _i < len(event.media_types) else ""
+                if event.message_type == MessageType.AUDIO or _mtype.startswith("audio/"):
+                    _has_audio_for_clone = True
+                    break
+            if _clone_intent and _has_audio_for_clone:
+                return await self._handle_voiceclone_command(event)
+
         # Expand alias quick commands before built-in dispatch so targets like
         # /model openai/gpt-5.5 --provider openrouter reach the /model handler.
         # Preserve built-in precedence; aliases only need early handling when
@@ -9485,6 +9502,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
+        if canonical == "voiceclone":
+            return await self._handle_voiceclone_command(event)
+
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
@@ -9717,7 +9737,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        _busy_voice_guild_id: Optional[int] = None
         try:
+            _busy_voice_guild_id = await self._start_discord_busy_audio_for_source(source)
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
@@ -9758,6 +9780,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Putting it in finally guarantees the revert on success, exception,
             # and interrupt alike.
             self._restore_moa_one_shot(event, _quick_key)
+            await self._stop_discord_busy_audio(_busy_voice_guild_id)
             # Unconditional release covers every exit path. _release_running_agent_state
             # is idempotent (pop-on-absent is harmless) and, called without a
             # run_generation guard, always clears the slot regardless of which
@@ -12099,6 +12122,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
 
+    async def _start_discord_busy_audio_for_source(self, source: SessionSource) -> Optional[int]:
+        """Mark a Discord VC as busy for source.chat_id and start busy audio.
+
+        Returns the guild id to pass to _stop_discord_busy_audio(), or None when
+        this source is not tied to an active Discord voice channel.
+        """
+        if source.platform != Platform.DISCORD:
+            return None
+        adapter = self.adapters.get(Platform.DISCORD)
+        voice_text_channels = getattr(adapter, "_voice_text_channels", None)
+        if not isinstance(voice_text_channels, dict):
+            return None
+        guild_id: Optional[int] = None
+        for gid, text_ch_id in voice_text_channels.items():
+            if str(text_ch_id) == str(source.chat_id):
+                guild_id = int(gid)
+                break
+        if guild_id is None:
+            return None
+        counts = getattr(self, "_busy_voice_guilds", None)
+        if not isinstance(counts, dict):
+            counts = {}
+            self._busy_voice_guilds = counts
+        counts[guild_id] = int(counts.get(guild_id, 0)) + 1
+        if counts[guild_id] == 1:
+            start_busy_audio = getattr(adapter, "start_busy_audio", None)
+            if start_busy_audio is not None:
+                try:
+                    await start_busy_audio(guild_id)
+                except Exception as e:
+                    logger.debug("Discord busy audio start failed: %s", e)
+        return guild_id
+
+    async def _stop_discord_busy_audio(self, guild_id: Optional[int]) -> None:
+        """Clear a busy mark and stop VC busy audio when the last task ends."""
+        if guild_id is None:
+            return
+        counts = getattr(self, "_busy_voice_guilds", None)
+        if not isinstance(counts, dict):
+            return
+        remaining = max(0, int(counts.get(guild_id, 0)) - 1)
+        if remaining:
+            counts[guild_id] = remaining
+            return
+        counts.pop(guild_id, None)
+        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is not None:
+            stop_busy_audio = getattr(adapter, "stop_busy_audio", None)
+            if stop_busy_audio is not None:
+                try:
+                    await stop_busy_audio(guild_id)
+                except Exception as e:
+                    logger.debug("Discord busy audio stop failed: %s", e)
+
+    def _is_discord_voice_busy(self, guild_id: int) -> bool:
+        counts = getattr(self, "_busy_voice_guilds", None)
+        return bool(isinstance(counts, dict) and int(counts.get(int(guild_id), 0)) > 0)
+
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
         adapter = self.adapters.get(event.source.platform)
@@ -12127,6 +12208,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
                 self._voice_key(Platform.DISCORD, str(chat_id)), "off"
             )
+        if hasattr(adapter, "_voice_busy_getter"):
+            setattr(adapter, "_voice_busy_getter", self._is_discord_voice_busy)
 
         try:
             success = await adapter.join_voice_channel(voice_channel)
@@ -12230,6 +12313,227 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recent_store[key] = recent[-5:]
         return False
 
+    _VOICE_WAKE_RE = re.compile(
+        r"(?:sif\s*rot|sifrot|sifra|sifrat|sif\s*rod|sifrod|sifred|sifr0t|"
+        r"sifroth|cypherot|cephrot|sypherot|cifra|cifrot|defra|frott|so\s+frott|"
+        r"zip\s*rot|ziprot|brock|cipri|steve\s+brod|fit\s*fright|sif\s*fright)\b\s*[,.:;!?-]*\s*",
+        re.IGNORECASE,
+    )
+
+    _VOICE_FOLLOWUP_WINDOW_SECONDS = 20
+    _VOICE_MAX_FOLLOWUP_WINDOW_SECONDS = 60
+    _VOICE_MIN_FOLLOWUP_WORDS = 3
+
+    def _discord_voice_listen_config(self) -> dict:
+        """Return Discord voice-listen config from the loaded gateway config."""
+        try:
+            platform_cfg = getattr(getattr(self, "config", None), "platforms", {}).get(Platform.DISCORD)
+            extra = getattr(platform_cfg, "extra", {}) if platform_cfg is not None else {}
+            voice_listen = extra.get("voice_listen") if isinstance(extra, dict) else None
+            return voice_listen if isinstance(voice_listen, dict) else {}
+        except Exception:
+            return {}
+
+    def _voice_followup_window_seconds(self) -> float:
+        """Short, configurable window for unaddressed same-user VC follow-ups."""
+        cfg = self._discord_voice_listen_config()
+        raw = cfg.get("followup_window_seconds", cfg.get("follow_up_window_seconds"))
+        if raw is None:
+            raw = getattr(self, "_VOICE_FOLLOWUP_WINDOW_SECONDS", 20)
+        try:
+            window = float(raw)
+        except (TypeError, ValueError):
+            window = float(getattr(self, "_VOICE_FOLLOWUP_WINDOW_SECONDS", 20))
+        if window <= 0:
+            return 0.0
+        return min(window, float(self._VOICE_MAX_FOLLOWUP_WINDOW_SECONDS))
+
+    def _voice_min_followup_words(self) -> int:
+        cfg = self._discord_voice_listen_config()
+        raw = cfg.get("min_followup_words")
+        if raw is None:
+            raw = getattr(self, "_VOICE_MIN_FOLLOWUP_WORDS", 3)
+        try:
+            words = int(raw)
+        except (TypeError, ValueError):
+            words = int(getattr(self, "_VOICE_MIN_FOLLOWUP_WORDS", 3))
+        return max(1, words)
+
+    def _is_unaddressed_voice_noise(self, transcript: str) -> bool:
+        """Reject common STT hallucinations before they can consume follow-up state."""
+        text = (transcript or "").strip()
+        if not text:
+            return True
+        try:
+            from tools.voice_mode import is_whisper_hallucination
+            if is_whisper_hallucination(text):
+                return True
+        except Exception:
+            pass
+
+        normalized = re.sub(r"[^a-z0-9']+", " ", text.lower()).strip()
+        normalized = re.sub(r"\s+", " ", normalized)
+        if not normalized:
+            return True
+
+        # Faster-whisper often emits polite/video boilerplate on silence.  The
+        # base filter catches many exact/repeated forms; keep these broader VC
+        # follow-up guards local so an explicitly addressed command still works.
+        if re.fullmatch(r"(?:thank you(?: very much)?\s*){1,4}", normalized):
+            return True
+        if re.fullmatch(r"(?:thanks?|thank you)(?: so much)? for watching(?: this video)?", normalized):
+            return True
+        if "thank you" in normalized and "watching" in normalized and len(normalized.split()) <= 10:
+            return True
+        # Observed shower/background-noise hallucination after VC wake.
+        if "pocket arrow" in normalized and "shower" in normalized:
+            return True
+        if "i am just in the shower" in normalized or "i'm just in the shower" in normalized:
+            return True
+        return False
+
+    def _extract_addressed_voice_command(self, transcript: str) -> Optional[str]:
+        """Return command text only when a Discord VC transcript addresses Sifrot.
+
+        Always-on Discord voice can transcribe background speech/noise as short
+        utterances.  Requiring an explicit address near the beginning prevents
+        stray speech like "oh" from becoming an agent turn.
+        """
+        text = (transcript or "").strip()
+        if not text:
+            return None
+        match = self._VOICE_WAKE_RE.search(text)
+        if not match:
+            return None
+        # STT often inserts a short noisy preamble before the wake name
+        # ("whaaaa SIFROT", "no, SIFROT"). Accept that, but do not let a
+        # buried mention in unrelated background conversation wake the agent.
+        preamble = text[:match.start()]
+        if len(re.findall(r"\w+", preamble)) > 7:
+            return None
+        command = text[match.end():].strip()
+        return command or "are you there?"
+
+    def _voice_followup_key(self, guild_id: int, user_id: int) -> tuple[int, int]:
+        return (int(guild_id), int(user_id))
+
+    def _mark_voice_conversation_active(self, guild_id: int, user_id: int) -> None:
+        store = getattr(self, "_voice_followup_until", None)
+        if store is None:
+            store = {}
+            self._voice_followup_until = store
+        key = self._voice_followup_key(guild_id, user_id)
+        window = self._voice_followup_window_seconds()
+        if window <= 0:
+            store.pop(key, None)
+            return
+        store[key] = time.time() + window
+
+    def _is_voice_conversation_followup(self, guild_id: int, user_id: int, transcript: str) -> bool:
+        text = (transcript or "").strip()
+        if not text:
+            return False
+        # Keep obvious one-word noise/interjections from reopening the agent loop.
+        if len(re.findall(r"\w+", text)) < self._voice_min_followup_words():
+            return False
+        if self._is_unaddressed_voice_noise(text):
+            return False
+        store = getattr(self, "_voice_followup_until", {})
+        key = self._voice_followup_key(guild_id, user_id)
+        until = store.get(key, 0)
+        if time.time() <= until:
+            return True
+        if isinstance(store, dict):
+            store.pop(key, None)
+        return False
+
+    def _extract_voice_command(self, guild_id: int, user_id: int, transcript: str) -> Optional[str]:
+        addressed = self._extract_addressed_voice_command(transcript)
+        if addressed is not None:
+            self._mark_voice_conversation_active(guild_id, user_id)
+            return addressed
+        if self._is_voice_conversation_followup(guild_id, user_id, transcript):
+            # Unaddressed follow-ups are deliberately not allowed to extend the
+            # window. A fresh wake name is required after the short grace period,
+            # so background noise cannot keep the agent awake indefinitely.
+            return (transcript or "").strip()
+        return None
+
+    _VOICE_CONFIRMATION_NAMES = (
+        "sifrot", "sifra", "sifroth", "cypherot", "cephrot", "cifra",
+        "defra", "frott", "so frott", "brock", "cipri",
+    )
+
+    def _discord_voice_guild_for_text_chat(self, adapter: Any, chat_id: str) -> Optional[int]:
+        """Return the Discord guild whose bound text channel matches *chat_id*."""
+        voice_text_channels = getattr(adapter, "_voice_text_channels", None)
+        if not isinstance(voice_text_channels, dict):
+            return None
+        for guild_id, text_ch_id in voice_text_channels.items():
+            if str(text_ch_id) == str(chat_id):
+                try:
+                    return int(guild_id)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    async def _speak_discord_voice_notice(
+        self,
+        source: SessionSource,
+        text: str,
+        *,
+        guild_id: Optional[int] = None,
+        context: str = "voice notice",
+    ) -> tuple[bool, bool]:
+        """Speak *text* in the bound Discord VC when possible.
+
+        Returns ``(attempted, success)``. If a bound and connected VC exists
+        but TTS/playback fails, this sends a visible text alarm so the failure
+        is not silent.
+        """
+        if source.platform != Platform.DISCORD:
+            return (False, False)
+        adapter = self.adapters.get(Platform.DISCORD)
+        if not adapter or not text:
+            return (False, False)
+        if guild_id is None:
+            guild_id = self._discord_voice_guild_for_text_chat(adapter, source.chat_id)
+        if not guild_id:
+            return (False, False)
+        try:
+            is_in_voice_channel = getattr(adapter, "is_in_voice_channel", None)
+            if not callable(is_in_voice_channel):
+                return (False, False)
+            in_voice = is_in_voice_channel(guild_id)
+            import inspect as _inspect
+            if _inspect.isawaitable(in_voice):
+                in_voice = await in_voice
+            if in_voice is not True:
+                return (False, False)
+        except Exception as exc:
+            logger.warning("Could not inspect Discord voice connection for %s: %s", context, exc)
+            return (False, False)
+
+        from types import SimpleNamespace
+        event = MessageEvent(
+            source=source,
+            text=text,
+            message_type=MessageType.VOICE,
+            raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
+        )
+        success = await self._send_voice_reply(event, text)
+        if success:
+            return (True, True)
+
+        alarm = f"⚠️ Voice notice failed while trying to speak this {context}. Check gateway logs for the TTS/playback error."
+        logger.error("Discord voice notice failed: context=%s guild=%s chat=%s", context, guild_id, source.chat_id)
+        try:
+            metadata = self._thread_metadata_for_source(source)
+            await adapter.send(source.chat_id, alarm, metadata=metadata)
+        except Exception as exc:
+            logger.error("Failed to send voice-notice failure alarm: %s", exc, exc_info=True)
+        return (True, False)
+
     async def _handle_voice_channel_input(
         self, guild_id: int, user_id: int, transcript: str
     ):
@@ -12276,11 +12580,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
+        voice_text = self._extract_voice_command(guild_id, user_id, transcript)
+        if voice_text is None:
+            logger.info(
+                "Ignoring unaddressed Discord voice transcript for guild=%s user=%s: %s",
+                guild_id,
+                user_id,
+                transcript[:100],
+            )
+            return
+
+        try:
+            from tools.voice_interactions import build_turn_start_confirmation
+            confirmation = build_turn_start_confirmation(
+                voice_text,
+                assistant_names=self._VOICE_CONFIRMATION_NAMES,
+            )
+            if confirmation:
+                async def _play_turn_start_confirmation() -> None:
+                    try:
+                        await self._speak_discord_voice_notice(
+                            source,
+                            confirmation.spoken_text,
+                            guild_id=guild_id,
+                            context="turn-start confirmation",
+                        )
+                    except Exception:
+                        logger.error("Background turn-start confirmation failed", exc_info=True)
+
+                try:
+                    asyncio.create_task(_play_turn_start_confirmation())
+                except RuntimeError:
+                    logger.error("Could not schedule turn-start confirmation", exc_info=True)
+        except Exception as exc:
+            logger.error("Voice turn-start confirmation failed: %s", exc, exc_info=True)
+            try:
+                client = getattr(adapter, "_client", None)
+                channel = client.get_channel(text_ch_id) if client else None
+                if channel:
+                    await channel.send(
+                        "⚠️ Voice turn-start confirmation failed before tool work. "
+                        "I’m continuing, but check gateway logs for the exact error."
+                    )
+            except Exception:
+                logger.error("Failed to send turn-start confirmation alarm", exc_info=True)
+
         # Show transcript in text channel (after auth, with mention sanitization)
         try:
             channel = adapter._client.get_channel(text_ch_id)
             if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+                safe_text = voice_text[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
                 await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
         except Exception:
             pass
@@ -12291,7 +12640,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from types import SimpleNamespace
         event = MessageEvent(
             source=source,
-            text=transcript,
+            text=voice_text,
             message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
         )
@@ -12352,7 +12701,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return True
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
+    async def _send_voice_reply(self, event: MessageEvent, text: str) -> bool:
         """Generate TTS audio and send as a voice message before the text reply."""
         import uuid as _uuid
         audio_path = None
@@ -12360,9 +12709,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
-            tts_text = _strip_markdown_for_tts(text[:4000])
+            # Plugin hook: transform_tts_text
+            # Fired only for auto voice replies, before markdown stripping and
+            # synthesis.  This lets voice middleware shorten/sanitize what is
+            # spoken without changing the complete written response.
+            spoken_source = text
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                _tts_transform_results = _invoke_hook(
+                    "transform_tts_text",
+                    response_text=text,
+                    tts_text=text,
+                    platform=event.source.platform.value if hasattr(event.source.platform, "value") else str(event.source.platform),
+                    chat_id=event.source.chat_id,
+                    message_type=event.message_type.value if hasattr(event.message_type, "value") else str(event.message_type),
+                )
+                for _hook_result in _tts_transform_results:
+                    if isinstance(_hook_result, str) and _hook_result.strip():
+                        spoken_source = _hook_result
+                        break
+            except Exception as exc:
+                logger.warning("transform_tts_text hook failed: %s", exc)
+
+            try:
+                from tools.voice_interactions import sanitize_for_speech as _sanitize_voice_text
+                spoken_source = _sanitize_voice_text(spoken_source)
+            except Exception as exc:
+                logger.warning("Voice sanitization failed, using unsanitized TTS text: %s", exc)
+
+            tts_text = _strip_markdown_for_tts(spoken_source[:4000])
             if not tts_text:
-                return
+                return False
 
             # Telegram's adapter only sends native voice bubbles for OGG/Opus.
             # Other platforms keep the existing MP3 default.
@@ -12380,23 +12757,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = json.loads(result_json)
             except (json.JSONDecodeError, TypeError):
                 logger.warning("Auto voice reply TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
-                return
+                return False
 
             # Use the actual file path from result (may differ after opus conversion)
             actual_path = result.get("file_path", audio_path)
             if not result.get("success") or not os.path.isfile(actual_path):
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
-                return
+                return False
 
             adapter = self.adapters.get(event.source.platform)
 
             # If connected to a voice channel, play there instead of sending a file
             guild_id = self._get_guild_id(event)
-            if (guild_id
-                    and hasattr(adapter, "play_in_voice_channel")
-                    and hasattr(adapter, "is_in_voice_channel")
-                    and adapter.is_in_voice_channel(guild_id)):
-                await adapter.play_in_voice_channel(guild_id, actual_path)
+            play_in_voice_channel = getattr(adapter, "play_in_voice_channel", None)
+            is_in_voice_channel = getattr(adapter, "is_in_voice_channel", None)
+            if (
+                guild_id
+                and callable(play_in_voice_channel)
+                and callable(is_in_voice_channel)
+                and is_in_voice_channel(guild_id)
+            ):
+                maybe_played = play_in_voice_channel(guild_id, actual_path)
+                import inspect as _inspect
+                played = await maybe_played if _inspect.isawaitable(maybe_played) else maybe_played
+                return bool(played)
             elif adapter and hasattr(adapter, "send_voice"):
                 reply_anchor = self._reply_anchor_for_event(event)
                 thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
@@ -12419,8 +12803,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "metadata": thread_meta,
                 }
                 await adapter.send_voice(**send_kwargs)
+                return True
+            return False
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
+            return False
         finally:
             for p in {audio_path, actual_path} - {None}:
                 try:
@@ -14104,6 +14491,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
         return delivered
+
+    async def _mirror_discord_approval_to_telegram_home(
+        self,
+        *,
+        approval_data: Dict[str, Any],
+        session_key: str,
+        source_chat_id: Optional[str] = None,
+    ) -> bool:
+        """Best-effort mirror of Discord approval prompts to Telegram home.
+
+        The originating Discord channel still receives the canonical prompt.
+        This mirror only gives the user a more reliable mobile push path; it
+        uses the same ``session_key`` so Telegram's approval buttons/commands
+        resolve the original pending approval.
+        """
+        adapter = self.adapters.get(Platform.TELEGRAM)
+        if adapter is None:
+            return False
+        home = self.config.get_home_channel(Platform.TELEGRAM)
+        if not home or not home.chat_id:
+            return False
+
+        cmd = str(approval_data.get("command", "") or "")
+        desc = str(approval_data.get("description", "dangerous command") or "dangerous command")
+        origin = f"Discord channel {source_chat_id}" if source_chat_id else "Discord"
+        mirror_desc = f"Mirrored from {origin}; the approval prompt also remains in Discord. {desc}"
+
+        metadata = self._thread_metadata_for_target(
+            Platform.TELEGRAM,
+            home.chat_id,
+            home.thread_id,
+            adapter=adapter,
+        ) or {}
+
+        send_exec_approval = getattr(adapter, "send_exec_approval", None)
+        if callable(send_exec_approval):
+            import inspect as _inspect
+            maybe_result = send_exec_approval(
+                chat_id=str(home.chat_id),
+                command=cmd,
+                session_key=session_key,
+                description=mirror_desc,
+                metadata=metadata,
+            )
+            result = await maybe_result if _inspect.isawaitable(maybe_result) else maybe_result
+            if result is None or getattr(result, "success", True):
+                return True
+            logger.warning(
+                "Telegram approval mirror button send failed: %s",
+                getattr(result, "error", "send returned success=False"),
+            )
+
+        prefix = getattr(adapter, "typed_command_prefix", "/")
+        cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+        msg = (
+            "⚠️ Approval needed for a Discord-originated command.\n"
+            f"Origin: {origin}\n"
+            f"Command:\n```\n{cmd_preview}\n```\n"
+            f"Reason: {desc}\n\n"
+            f"Reply `{prefix}approve` to execute or `{prefix}deny` to cancel."
+        )
+        result = await adapter.send(str(home.chat_id), msg, metadata=metadata or None)
+        return bool(result is None or getattr(result, "success", True))
 
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
@@ -16709,6 +17159,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 
+        _status_thread_metadata = dict(_status_thread_metadata or {})
+        if getattr(source, "user_id", None):
+            _status_thread_metadata.setdefault("user_id", str(source.user_id))
+        if getattr(source, "user_name", None):
+            _status_thread_metadata.setdefault("user_name", str(source.user_name))
+
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
@@ -17376,6 +17832,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (send_exec_approval) and plain-text fallback paths below use
                 # the redacted value.
                 cmd = _redact_approval_command(cmd)
+                redacted_approval_data = dict(approval_data or {})
+                redacted_approval_data["command"] = cmd
+
+                def _speak_approval_prompt() -> None:
+                    try:
+                        from tools.voice_interactions import build_permission_prompt
+                        cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+                        prompt = build_permission_prompt(
+                            "run a command that needs approval",
+                            reason=desc,
+                            risk="This may change files, services, or system state",
+                            targets=(cmd_preview,) if cmd_preview else (),
+                        )
+                        fut = safe_schedule_threadsafe(
+                            self._speak_discord_voice_notice(
+                                source,
+                                prompt.spoken_text,
+                                context="approval prompt",
+                            ),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="spoken approval prompt scheduling error",
+                        )
+                        if fut is None:
+                            return
+
+                        def _log_spoken_approval_result(done_fut) -> None:
+                            try:
+                                attempted, success = done_fut.result()
+                                if attempted and not success:
+                                    logger.error("Spoken approval prompt failed for session %s", _approval_session_key)
+                            except Exception as result_exc:
+                                logger.error("Spoken approval prompt task failed: %s", result_exc, exc_info=True)
+
+                        fut.add_done_callback(_log_spoken_approval_result)
+                    except Exception as exc:
+                        logger.error("Spoken approval prompt failed before delivery: %s", exc, exc_info=True)
+
+                def _mirror_approval_to_telegram() -> None:
+                    if source.platform != Platform.DISCORD:
+                        return
+                    fut = safe_schedule_threadsafe(
+                        self._mirror_discord_approval_to_telegram_home(
+                            approval_data=redacted_approval_data,
+                            session_key=_approval_session_key,
+                            source_chat_id=str(source.chat_id) if source.chat_id else None,
+                        ),
+                        _loop_for_step,
+                        logger=logger,
+                        log_message="Telegram approval mirror scheduling error",
+                    )
+                    if fut is None:
+                        return
+                    try:
+                        fut.result(timeout=15)
+                    except Exception as exc:
+                        logger.warning("Telegram approval mirror failed: %s", exc)
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
@@ -17398,6 +17911,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             raise RuntimeError("send_exec_approval: loop unavailable")
                         _approval_result = _approval_fut.result(timeout=15)
                         if _approval_result.success:
+                            _speak_approval_prompt()
+                            _mirror_approval_to_telegram()
                             return
                         logger.warning(
                             "Button-based approval failed (send returned error), falling back to text: %s",
@@ -17434,6 +17949,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if _approval_send_fut is not None:
                         _approval_send_fut.result(timeout=15)
+                    _speak_approval_prompt()
+                    _mirror_approval_to_telegram()
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
 

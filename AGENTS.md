@@ -85,6 +85,11 @@ conservative at the waist.
   resolution chains, config propagation, security boundaries, remote
   backends, or file/network I/O, exercise the real path with real imports
   against a temp `HERMES_HOME`. Mocks hide integration bugs.
+- **Testable features, loud failures.** New behavior should include focused
+  tests or an explicit verification path, and failure modes must surface a
+  clear user/operator-visible reason instead of being swallowed. If something
+  cannot complete, log the root cause and emit an alarm/notice through the
+  relevant UI rather than silently continuing.
 - **Cache-, alternation-, and invariant-safe.** Preserve prompt caching, strict
   message role alternation (never two same-role messages in a row; never a
   synthetic user message injected mid-loop), and a system prompt that is

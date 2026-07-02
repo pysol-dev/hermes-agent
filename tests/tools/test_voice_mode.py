@@ -875,6 +875,14 @@ class TestWhisperHallucinationFilter:
         assert is_whisper_hallucination("Thank you for your help with the project.") is False
         assert is_whisper_hallucination("Can you explain this code?") is False
 
+    def test_repeated_georgian_hallucinations_filtered(self):
+        from tools.voice_mode import is_whisper_hallucination
+
+        assert is_whisper_hallucination("ლ ლ ლ ლ") is True
+        assert is_whisper_hallucination("ა ა ა ა") is True
+        assert is_whisper_hallucination("ⴀ ⴀ ⴀ ⴀ") is True
+        assert is_whisper_hallucination("ქართული ტექსტი") is False
+
 
 # ============================================================================
 # play_audio_file
