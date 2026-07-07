@@ -9132,6 +9132,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "background":
                 return await self._handle_background_command(event)
 
+            # /ask is foreground prompt sugar. It must never become a
+            # background task or queued follow-up; while another foreground
+            # turn is running, ask the user to retry between turns.
+            if _cmd_def_inner and _cmd_def_inner.name == "ask":
+                ask_payload = event.get_command_args().strip()
+                if not ask_payload:
+                    return "Usage: /ask <prompt>"
+                return (
+                    "⏳ Agent is running — wait for the current response or "
+                    "`/stop` first, then use `/ask <prompt>`."
+                )
+
             # /kanban must bypass the guard. It writes to a profile-agnostic
             # DB (kanban.db), not to the running agent's state. In fact
             # /kanban unblock is often the only way to free a worker that
@@ -9647,6 +9659,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "background":
             return await self._handle_background_command(event)
+
+        if canonical == "ask":
+            # Foreground gateway prompt: strip the slash command and fall
+            # through to the normal agent path so the turn is indistinguishable
+            # from the user sending the same text directly in this chat.
+            ask_payload = event.get_command_args().strip()
+            if not ask_payload:
+                return "Usage: /ask <prompt>"
+            try:
+                event.text = ask_payload
+            except Exception:
+                pass
+            # From here on this must be treated exactly like plain text.
+            # Clear slash-command state so user quick commands, plugin
+            # commands, and skill commands named "ask" cannot intercept it.
+            command = None
+            canonical = None
+            _cmd_def = None
 
         if canonical == "steer":
             # No active agent — /steer has no tool call to inject into.
