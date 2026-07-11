@@ -71,6 +71,12 @@ class FakeTextChannel:
         return _iter()
 
 
+class FakeVoiceChannel(FakeTextChannel):
+    def __init__(self, channel_id: int = 1, name: str = "General Voice", guild_name: str = "Hermes Server"):
+        super().__init__(channel_id=channel_id, name=name, guild_name=guild_name)
+        self.type = 2
+
+
 class FakeForumChannel:
     def __init__(self, channel_id: int = 1, name: str = "support-forum", guild_name: str = "Hermes Server"):
         self.id = channel_id
@@ -100,6 +106,7 @@ class FakeThread:
 def adapter(monkeypatch):
     monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)
     monkeypatch.setattr(discord_platform.discord, "Thread", FakeThread, raising=False)
+    monkeypatch.setattr(discord_platform.discord, "VoiceChannel", FakeVoiceChannel, raising=False)
     monkeypatch.setattr(discord_platform.discord, "ForumChannel", FakeForumChannel, raising=False)
 
     # Clear DISCORD_* env vars the test file exercises so tests don't leak
@@ -543,6 +550,52 @@ async def test_discord_no_thread_matches_channel_name(adapter, monkeypatch):
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_discord_voice_channel_text_chat_skips_auto_thread(adapter, monkeypatch):
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    adapter._auto_create_thread = AsyncMock()
+    message = make_message(
+        channel=FakeVoiceChannel(channel_id=1507934682702938244),
+        content="hello from voice channel text chat",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "hello from voice channel text chat"
+    assert event.source.chat_id == "1507934682702938244"
+    assert event.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_discord_auto_thread_failure_in_text_channel_warns_and_skips_agent(adapter, monkeypatch):
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+
+    class SendableTextChannel(FakeTextChannel):
+        def __init__(self):
+            super().__init__(channel_id=123)
+            self.send = AsyncMock()
+
+    channel = SendableTextChannel()
+    adapter._auto_create_thread = AsyncMock(return_value=None)
+    message = make_message(channel=channel, content="please make a thread")
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once_with(message)
+    channel.send.assert_awaited_once()
+    assert channel.send.await_args is not None
+    warning = channel.send.await_args.args[0]
+    assert "could not create a Discord thread" in warning
+    assert "request was not processed" in warning
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

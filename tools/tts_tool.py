@@ -10,6 +10,7 @@ Built-in TTS providers:
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
 - xAI TTS: Grok voices, uses xAI Grok OAuth credentials or XAI_API_KEY
+- Local HTTP TTS: OpenAI-compatible local sidecars (e.g. XTTS/Coqui)
 - NeuTTS (local, free, no API key): On-device TTS via neutts
 - KittenTTS (local, free, no API key): On-device 25MB model
 - Piper (local, free, no API key): OHF-Voice/piper1-gpl neural VITS, 44 languages
@@ -205,6 +206,10 @@ DEFAULT_GEMINI_TTS_VOICE = "Kore"
 DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_GEMINI_AUDIO_TAGS = False
 GEMINI_AUDIO_TAG_REWRITE_TASK = "tts_audio_tags"
+DEFAULT_LOCAL_HTTP_TTS_BASE_URL = "http://127.0.0.1:8020/v1"
+DEFAULT_LOCAL_HTTP_TTS_MODEL = "xtts-v2"
+DEFAULT_LOCAL_HTTP_TTS_VOICE = "default"
+DEFAULT_LOCAL_HTTP_TTS_TIMEOUT = 120
 # PCM output specs for Gemini TTS (fixed by the API)
 GEMINI_TTS_SAMPLE_RATE = 24000
 GEMINI_TTS_CHANNELS = 1
@@ -230,6 +235,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "minimax": 10000,     # https://platform.minimax.io/docs/api-reference/speech-t2a-http (sync)
     "mistral": 4000,      # conservative; no published per-request cap
     "gemini": 32000,      # Gemini TTS has a 32k-token context window; char cap is conservative
+    "local_http": 5000,   # local OpenAI-compatible sidecars vary; keep Edge-like practical default
     "elevenlabs": 10000,  # fallback when model-aware lookup can't resolve (multilingual_v2)
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
@@ -394,6 +400,7 @@ BUILTIN_TTS_PROVIDERS = frozenset({
     "xai",
     "mistral",
     "gemini",
+    "local_http",
     "neutts",
     "kittentts",
     "piper",
@@ -494,7 +501,7 @@ def _dispatch_to_plugin_provider(
        a refactor of the caller can't silently break the invariant.
     3. Plugin dispatch fires only when ``provider`` matches a registered
        :class:`TTSProvider` whose ``name`` equals the configured value.
-       Unknown names return None (caller falls through to Edge default).
+       Unknown names return None so the caller can surface a clear error.
 
     Plugin exceptions are caught and re-raised — the outer
     ``text_to_speech_tool`` try/except converts them to the standard
@@ -1073,6 +1080,150 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
         close = getattr(client, "close", None)
         if callable(close):
             close()
+
+
+def _local_http_response_format(output_path: str) -> str:
+    """Return the OpenAI-compatible ``response_format`` for an output path."""
+    suffix = Path(output_path).suffix.lower().lstrip(".")
+    if suffix in {"ogg", "opus"}:
+        return "opus"
+    if suffix in {"wav", "flac", "aac"}:
+        return suffix
+    return "mp3"
+
+
+def _resolve_local_http_tts_endpoint(local_config: Dict[str, Any]) -> str:
+    """Resolve a local_http endpoint, defaulting to ``<base_url>/audio/speech``."""
+    endpoint = str(local_config.get("endpoint") or "").strip()
+    if endpoint:
+        return endpoint
+    base_url = str(
+        local_config.get("base_url") or DEFAULT_LOCAL_HTTP_TTS_BASE_URL
+    ).strip()
+    if not base_url:
+        raise ValueError("tts.local_http.base_url is not configured")
+    return f"{base_url.rstrip('/')}/audio/speech"
+
+
+# ===========================================================================
+# Provider: Local HTTP TTS (OpenAI-compatible)
+# ===========================================================================
+def _generate_local_http_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate audio through a local OpenAI-compatible HTTP TTS sidecar.
+
+    The provider reads ``tts.local_http`` and POSTs to ``/audio/speech`` by
+    default. ``endpoint`` may override the full URL for sidecars that expose a
+    different route. ``extra_body`` is merged into the JSON payload so local
+    engines can receive XTTS/Coqui-specific controls such as ``speaker_wav`` or
+    effect presets without Hermes knowing those fields.
+    """
+    import requests
+
+    local_config = tts_config.get("local_http", {})
+    if not isinstance(local_config, dict):
+        local_config = {}
+
+    endpoint = _resolve_local_http_tts_endpoint(local_config)
+    model = str(local_config.get("model") or DEFAULT_LOCAL_HTTP_TTS_MODEL)
+    voice = str(local_config.get("voice") or DEFAULT_LOCAL_HTTP_TTS_VOICE)
+    timeout_raw = local_config.get("timeout", DEFAULT_LOCAL_HTTP_TTS_TIMEOUT)
+    try:
+        timeout = float(timeout_raw)
+    except (TypeError, ValueError):
+        timeout = float(DEFAULT_LOCAL_HTTP_TTS_TIMEOUT)
+    if timeout <= 0:
+        timeout = float(DEFAULT_LOCAL_HTTP_TTS_TIMEOUT)
+
+    extra_body = local_config.get("extra_body") or {}
+    if not isinstance(extra_body, dict):
+        raise ValueError("tts.local_http.extra_body must be a mapping when configured")
+
+    payload: Dict[str, Any] = {
+        "model": model,
+        "input": text,
+        "voice": voice,
+        "response_format": _local_http_response_format(output_path),
+    }
+    payload.update(extra_body)
+
+    headers = {
+        "Accept": "audio/*",
+        "Content-Type": "application/json",
+    }
+    api_key = str(
+        local_config.get("api_key")
+        or get_env_value("LOCAL_HTTP_TTS_API_KEY")
+        or get_env_value("TTS_LOCAL_HTTP_API_KEY")
+        or ""
+    ).strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response = requests.post(endpoint, json=payload, headers=headers, timeout=timeout)
+    status_code = getattr(response, "status_code", 200)
+    if status_code < 200 or status_code >= 300:
+        detail = getattr(response, "text", "") or ""
+        if not detail:
+            content = getattr(response, "content", b"") or b""
+            detail = (
+                content[:300].decode("utf-8", errors="replace")
+                if isinstance(content, bytes)
+                else str(content)[:300]
+            )
+        detail = detail.strip() or "no response body"
+        raise RuntimeError(f"local_http TTS HTTP {status_code}: {detail}")
+
+    audio = getattr(response, "content", b"") or b""
+    if not audio:
+        raise RuntimeError("local_http TTS returned empty audio")
+
+    with open(output_path, "wb") as f:
+        f.write(audio)
+    return output_path
+
+
+_TTS_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_TTS_PATH_RE = re.compile(
+    r"(?<!\w)(?:(?:~[/\\]|/|[A-Za-z]:[/\\])(?:[^\s`'\")\]}<>,;]+[/\\]?)+)",
+)
+_TTS_BARE_FILENAME_RE = re.compile(
+    r"(?<![\w/\\.-])(?P<name>[A-Za-z0-9_.-]+)\."
+    r"(?P<ext>wav|mp3|ogg|py|sh|yaml|yml|json|toml|log|db)\b",
+    re.IGNORECASE,
+)
+_TTS_HASH_RE = re.compile(r"\b[0-9a-f]{12,}\b", re.IGNORECASE)
+_TTS_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_TTS_CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
+_TTS_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((?:[^)]+)\)")
+
+
+def _sanitize_tts_provider_text(text: str) -> str:
+    """Replace machine-heavy fragments with speakable labels before synthesis."""
+    if not text:
+        return ""
+    text = _TTS_CODE_BLOCK_RE.sub(" code block ", text)
+    text = _TTS_MD_LINK_RE.sub(r"\1", text)
+    text = _TTS_URL_RE.sub(" a link ", text)
+    text = _TTS_UUID_RE.sub(" an identifier ", text)
+    text = _TTS_HASH_RE.sub(" a hash ", text)
+    text = _TTS_PATH_RE.sub(" a file path ", text)
+
+    def _filename(match: re.Match[str]) -> str:
+        ext = match.group("ext").lower()
+        if ext in {"wav", "mp3", "ogg"}:
+            return " an audio file "
+        if ext in {"py", "sh"}:
+            return " a script file "
+        if ext in {"yaml", "yml", "json", "toml"}:
+            return " a config file "
+        return " a data file "
+
+    text = _TTS_BARE_FILENAME_RE.sub(_filename, text)
+    text = re.sub(r"[*_>#|]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 # ===========================================================================
@@ -2176,6 +2327,9 @@ def text_to_speech_tool(
 
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
+    text = _sanitize_tts_provider_text(text)
+    if not text:
+        return tool_error("Text is empty after TTS sanitization", success=False)
 
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here
@@ -2238,7 +2392,7 @@ def text_to_speech_tool(
             file_path = out_dir / f"tts_{timestamp}.{fmt}"
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
+        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini", "local_http"}:
             file_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
@@ -2259,18 +2413,29 @@ def text_to_speech_tool(
 
         # Plugin-registered TTS backend (issue #30398). Fires when the
         # configured provider is neither a built-in nor a command-type
-        # entry, AND a plugin is registered under that name. The walrus
-        # binds `_plugin_path` only when the dispatcher returns a path
-        # (i.e. a plugin was actually found); a None return falls
-        # through to the built-in elif chain so unknown names hit the
-        # Edge TTS default at the bottom. The dispatcher itself enforces
-        # built-ins-always-win + command-wins-over-plugin defensively.
+        # entry, AND a plugin is registered under that name. Unknown
+        # explicit provider names must error instead of silently falling
+        # through to Edge while the response still reports the unknown name.
+        # The dispatcher itself enforces built-ins-always-win +
+        # command-wins-over-plugin defensively.
         elif provider not in BUILTIN_TTS_PROVIDERS and (
             _plugin_path := _dispatch_to_plugin_provider(
                 text, file_str, provider, tts_config,
             )
         ) is not None:
             file_str = _plugin_path
+
+        elif provider not in BUILTIN_TTS_PROVIDERS:
+            known = ", ".join(sorted(BUILTIN_TTS_PROVIDERS))
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Unsupported TTS provider '{provider}'. Configure a built-in "
+                    f"provider ({known}), a tts.providers.{provider} command, "
+                    "or an enabled plugin with that provider name."
+                ),
+                "provider": provider,
+            }, ensure_ascii=False)
 
         elif provider == "elevenlabs":
             try:
@@ -2317,6 +2482,12 @@ def text_to_speech_tool(
         elif provider == "gemini":
             logger.info("Generating speech with Google Gemini TTS...")
             _generate_gemini_tts(text, file_str, tts_config)
+
+        elif provider == "local_http":
+            logger.info("Generating speech with local_http TTS...")
+            generated_path = _generate_local_http_tts(text, file_str, tts_config)
+            if isinstance(generated_path, str) and generated_path:
+                file_str = generated_path
 
         elif provider == "neutts":
             if not _check_neutts_available():
@@ -2426,7 +2597,7 @@ def text_to_speech_tool(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
+        elif provider in {"elevenlabs", "openai", "mistral", "gemini", "local_http"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")
 
         file_size = os.path.getsize(file_str)
@@ -2478,6 +2649,9 @@ def check_tts_requirements() -> bool:
     """
     # Any configured command provider counts as available.
     if _has_any_command_tts_provider():
+        return True
+    tts_config = _load_tts_config()
+    if _get_provider(tts_config) == "local_http":
         return True
     try:
         _import_edge_tts()
