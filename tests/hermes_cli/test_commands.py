@@ -191,6 +191,13 @@ class TestGatewayKnownCommands:
         assert "bg" in GATEWAY_KNOWN_COMMANDS
         assert "background" in GATEWAY_KNOWN_COMMANDS
 
+    def test_ask_is_gateway_command(self):
+        ask = resolve_command("ask")
+        assert ask is not None
+        assert ask.name == "ask"
+        assert ask.args_hint == "<prompt>"
+        assert "ask" in GATEWAY_KNOWN_COMMANDS
+
     def test_is_frozenset(self):
         assert isinstance(GATEWAY_KNOWN_COMMANDS, frozenset)
 
@@ -250,6 +257,7 @@ class TestTelegramBotCommands:
         are now included because their handlers return usage text when
         invoked without arguments — issue #24312."""
         names = {name for name, _ in telegram_bot_commands()}
+        assert "ask" in names
         assert "background" in names
         assert "queue" in names
         assert "steer" in names
@@ -324,7 +332,7 @@ class TestSlackNativeSlashes:
     def test_includes_canonical_commands(self):
         names = {n for n, _d, _h in slack_native_slashes()}
         # Sample of gateway-available canonical commands
-        for expected in ("new", "stop", "background", "model", "help"):
+        for expected in ("new", "stop", "ask", "background", "model", "help"):
             assert expected in names, f"missing canonical /{expected}"
 
     def test_excludes_slack_reserved_commands(self):
@@ -1238,6 +1246,7 @@ class TestTelegramMenuCommands:
             "update",
             "verbose",
             "commands",
+            "ask",
             "help",
             "new",
             "stop",

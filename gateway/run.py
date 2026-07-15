@@ -3271,6 +3271,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             disabled_chats.discard(chat_id)
 
+    @staticmethod
+    def _is_discord_adapter(adapter) -> bool:
+        """Return True for the Discord adapter without importing plugin code."""
+        return getattr(adapter, "platform", None) == Platform.DISCORD
+
     def _set_adapter_auto_tts_enabled(self, adapter, chat_id: str, enabled: bool) -> None:
         """Update an adapter's per-chat auto-TTS opt-in set if present.
 
@@ -3281,6 +3286,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not isinstance(enabled_chats, set):
             return
         if enabled:
+            # Discord voice-channel replies are runner-owned: _send_voice_reply()
+            # can call play_in_voice_channel(), while the generic base adapter
+            # auto-TTS path only sees text-channel delivery and can silently
+            # fail/duplicate.  Do not opt Discord chats into the generic path.
+            if self._is_discord_adapter(adapter):
+                return
             enabled_chats.add(chat_id)
             # An explicit opt-in clears any stale /voice off for this chat.
             disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
@@ -3328,10 +3339,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         if isinstance(enabled_chats, set):
             enabled_chats.clear()
-            enabled_chats.update(
-                key[len(prefix):] for key, mode in self._voice_mode.items()
-                if mode in {"voice_only", "all"} and key.startswith(prefix)
-            )
+            if platform != Platform.DISCORD:
+                enabled_chats.update(
+                    key[len(prefix):] for key, mode in self._voice_mode.items()
+                    if mode in {"voice_only", "all"} and key.startswith(prefix)
+                )
 
     async def _safe_adapter_disconnect(self, adapter, platform) -> None:
         """Call adapter.disconnect() defensively, swallowing any error.
@@ -9398,6 +9410,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "background":
                 return await self._handle_background_command(event)
 
+            # /ask is foreground prompt sugar. It must never become a
+            # background task or queued follow-up; while another foreground
+            # turn is running, ask the user to retry between turns.
+            if _cmd_def_inner and _cmd_def_inner.name == "ask":
+                ask_payload = event.get_command_args().strip()
+                if not ask_payload:
+                    return "Usage: /ask <prompt>"
+                return (
+                    "⏳ Agent is running — wait for the current response or "
+                    "`/stop` first, then use `/ask <prompt>`."
+                )
+
             # /kanban must bypass the guard. It writes to a profile-agnostic
             # DB (kanban.db), not to the running agent's state. In fact
             # /kanban unblock is often the only way to free a worker that
@@ -9929,6 +9953,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "background":
             return await self._handle_background_command(event)
+
+        if canonical == "ask":
+            # Foreground gateway prompt: strip the slash command and fall
+            # through to the normal agent path so the turn is indistinguishable
+            # from the user sending the same text directly in this chat.
+            ask_payload = event.get_command_args().strip()
+            if not ask_payload:
+                return "Usage: /ask <prompt>"
+            try:
+                event.text = ask_payload
+            except Exception:
+                pass
+            # From here on this must be treated exactly like plain text.
+            # Clear slash-command state so user quick commands, plugin
+            # commands, and skill commands named "ask" cannot intercept it.
+            command = None
+            canonical = None
+            _cmd_def = None
 
         if canonical == "steer":
             # No active agent — /steer has no tool call to inject into.
@@ -12838,6 +12880,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
                 self._voice_key(Platform.DISCORD, str(chat_id)), "off"
             )
+        if hasattr(adapter, "_voice_busy_getter"):
+            adapter._voice_busy_getter = self._is_voice_channel_busy
 
         try:
             success = await adapter.join_voice_channel(voice_channel)
@@ -12890,15 +12934,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._voice_input_callback = None
         return "Left voice channel."
 
+    def _is_voice_channel_busy(self, guild_id: int) -> bool:
+        """Return True while a linked Discord VC session has an active agent turn."""
+        adapter = self.adapters.get(Platform.DISCORD)
+        if not adapter:
+            return False
+        text_ch_id = getattr(adapter, "_voice_text_channels", {}).get(guild_id)
+        if text_ch_id is None:
+            return False
+
+        source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
+        if source_data:
+            try:
+                source = SessionSource.from_dict(source_data)
+            except Exception:
+                source = None
+        else:
+            source = None
+        if source is None:
+            source = SessionSource(
+                platform=Platform.DISCORD,
+                chat_id=str(text_ch_id),
+                user_id="",
+                user_name="",
+                chat_type="channel",
+            )
+        session_key = self._session_key_for_source(source)
+        return bool(session_key and session_key in getattr(self, "_running_agents", {}))
+
     def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
         """Called by the adapter when a voice channel times out.
 
-        Cleans up runner-side voice_mode state that the adapter cannot reach.
+        Idle timeout disconnects only the Discord voice socket. It must not
+        persist ``/voice`` mode to off; otherwise an automatic timeout erases the
+        user's chat-level voice preference. Explicit ``/voice leave`` and
+        ``/voice off`` still write off in their command handlers.
         """
-        self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
-        self._save_voice_modes()
-        adapter = self.adapters.get(Platform.DISCORD)
-        self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+        logger.info("Discord voice idle timeout disconnected chat %s without changing /voice mode", chat_id)
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for the same recent utterance.
@@ -13041,11 +13113,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not should:
             return False
 
-        # Dedup: agent already called TTS tool
+        # Dedup: agent already called the TTS tool.
         has_agent_tts = any(
             msg.get("role") == "assistant"
             and any(
-                tc.get("function", {}).get("name") == "text_to_speech"
+                tc.get("function", {}).get("name") in {"text_to_speech", "text_to_speech_tool"}
                 for tc in (msg.get("tool_calls") or [])
             )
             for msg in agent_messages
@@ -13053,12 +13125,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if has_agent_tts:
             return False
 
-        # Dedup: base adapter auto-TTS already handles voice input
-        # (play_tts plays in VC when connected, so runner can skip).
-        # When streaming already delivered the text (already_sent=True),
-        # the base adapter will receive None and can't run auto-TTS,
-        # so the runner must take over.
-        if is_voice_input and not already_sent:
+        # For non-Discord voice input, base adapter auto-TTS still owns the
+        # voice-first path when text has not already been streamed.  Discord VC
+        # is different: runner-owned _send_voice_reply() can call
+        # play_in_voice_channel(), and Discord voice-linked chats are suppressed
+        # from the generic adapter opt-in path to avoid duplicate/silent TTS.
+        if (
+            is_voice_input
+            and not already_sent
+            and event.source.platform != Platform.DISCORD
+        ):
             return False
 
         return True
@@ -13072,6 +13148,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import uuid as _uuid
         audio_path = None
         actual_path = None
+        adapter = None
+        guild_id = None
+        voice_busy_marked = False
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
@@ -13088,6 +13167,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             os.makedirs(os.path.dirname(audio_path), exist_ok=True)
 
+            adapter = self._adapter_for_source(event.source)
+            guild_id = self._get_guild_id(event)
+            in_voice_channel = bool(
+                adapter
+                and guild_id
+                and hasattr(adapter, "is_in_voice_channel")
+                and adapter.is_in_voice_channel(guild_id)
+            )
+            if in_voice_channel and hasattr(adapter, "set_voice_busy"):
+                adapter.set_voice_busy(guild_id, True)
+                voice_busy_marked = True
+
             result_json = await asyncio.to_thread(
                 text_to_speech_tool, text=tts_text, output_path=audio_path
             )
@@ -13103,15 +13194,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
                 return
 
-            adapter = self._adapter_for_source(event.source)
-
             # If connected to a voice channel, play there instead of sending a file
-            guild_id = self._get_guild_id(event)
-            if (guild_id
+            if (adapter
+                    and guild_id
                     and hasattr(adapter, "play_in_voice_channel")
                     and hasattr(adapter, "is_in_voice_channel")
                     and adapter.is_in_voice_channel(guild_id)):
-                await adapter.play_in_voice_channel(guild_id, actual_path)
+                played = await adapter.play_in_voice_channel(guild_id, actual_path)
+                if played is False:
+                    logger.warning(
+                        "Auto voice reply playback failed in Discord voice channel (guild=%s)",
+                        guild_id,
+                    )
             elif adapter and hasattr(adapter, "send_voice"):
                 reply_anchor = self._reply_anchor_for_event(event)
                 thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
@@ -13133,7 +13227,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "reply_to": reply_anchor,
                     "metadata": thread_meta,
                 }
-                await adapter.send_voice(**send_kwargs)
+                send_result = await adapter.send_voice(**send_kwargs)
+                if getattr(send_result, "success", True) is False:
+                    logger.warning(
+                        "Auto voice reply send_voice failed for %s:%s: %s",
+                        event.source.platform.value,
+                        event.source.chat_id,
+                        getattr(send_result, "error", None) or "unknown error",
+                    )
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
@@ -13142,6 +13243,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     os.unlink(p)
                 except OSError:
                     pass
+            if voice_busy_marked and adapter and guild_id and hasattr(adapter, "set_voice_busy"):
+                try:
+                    adapter.set_voice_busy(guild_id, False)
+                except Exception:
+                    logger.debug("Failed to clear Discord voice busy mark", exc_info=True)
 
     async def _deliver_media_from_response(
         self,

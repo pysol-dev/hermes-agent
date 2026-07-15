@@ -4970,6 +4970,18 @@ class BasePlatformAdapter(ABC):
                             )
                             tts_data = _json.loads(tts_result_str)
                             _tts_path = tts_data.get("file_path")
+                            if not tts_data.get("success"):
+                                logger.warning(
+                                    "[%s] Auto-TTS tool returned failure: %s",
+                                    self.name,
+                                    tts_data.get("error") or "unknown error",
+                                )
+                                _tts_path = None
+                            elif not _tts_path:
+                                logger.warning(
+                                    "[%s] Auto-TTS tool returned success but no file_path",
+                                    self.name,
+                                )
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
 

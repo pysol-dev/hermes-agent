@@ -201,6 +201,22 @@ class TestCommandBypassActiveSession:
         )
 
     @pytest.mark.asyncio
+    async def test_ask_bypasses_guard(self):
+        """/ask must reach the runner so it can strip the prefix explicitly."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/ask summarize HN"))
+
+        assert sk not in adapter._pending_messages, (
+            "/ask was queued as a pending message instead of being dispatched"
+        )
+        assert any("handled:ask" in r for r in adapter.sent_responses), (
+            "/ask response was not sent back to the user"
+        )
+
+    @pytest.mark.asyncio
     async def test_steer_bypasses_guard(self):
         """/steer must bypass the Level-1 active-session guard so it reaches
         the gateway runner's /steer handler and injects into the running
