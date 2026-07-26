@@ -69,6 +69,8 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
+_RESTART_NOTIFY_READY_TIMEOUT = 30.0
+_RESTART_NOTIFY_DEGRADED_ERROR = "send_path_degraded"
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
@@ -16849,14 +16851,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return True
 
-    async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
+    def _restart_notify_marker_still_current(
+        self,
+        notify_path: Path,
+        expected_marker_text: Optional[str],
+    ) -> bool:
+        if expected_marker_text is None:
+            return True
+        try:
+            return notify_path.read_text(encoding="utf-8") == expected_marker_text
+        except FileNotFoundError:
+            return False
+        except Exception:
+            logger.debug("Restart notification marker check failed", exc_info=True)
+            return False
+
+    def _cleanup_restart_notify_marker(
+        self,
+        notify_path: Path,
+        expected_marker_text: Optional[str],
+    ) -> None:
+        if self._restart_notify_marker_still_current(notify_path, expected_marker_text):
+            notify_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _is_restart_notify_send_path_degraded(result: Any) -> bool:
+        if result is None or getattr(result, "success", True) is not False:
+            return False
+        return (
+            getattr(result, "retryable", False) is True
+            and str(getattr(result, "error", "")) == _RESTART_NOTIFY_DEGRADED_ERROR
+        )
+
+    async def _wait_for_restart_notify_send_ready(self, adapter: Any) -> None:
+        """Wait once, bounded, for adapter send-path readiness before retrying."""
+        progress = getattr(adapter, "_polling_progress_event", None)
+        try:
+            if progress is not None and hasattr(progress, "wait"):
+                await asyncio.wait_for(progress.wait(), timeout=_RESTART_NOTIFY_READY_TIMEOUT)
+                return
+            await asyncio.sleep(_RESTART_NOTIFY_READY_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Restart notification readiness wait timed out after %.1fs",
+                _RESTART_NOTIFY_READY_TIMEOUT,
+            )
+
+    def _schedule_restart_notification_retry(self, adapter: Any, marker_text: str) -> None:
+        task = getattr(self, "_restart_notify_retry_task", None)
+        if task is not None and not task.done():
+            logger.debug("Restart notification retry already scheduled")
+            return
+
+        async def _retry_once_after_ready() -> None:
+            try:
+                await self._wait_for_restart_notify_send_ready(adapter)
+                await self._send_restart_notification(
+                    _expected_marker_text=marker_text,
+                    _schedule_degraded_retry=False,
+                )
+            except Exception:
+                logger.warning("Restart notification retry failed", exc_info=True)
+
+        task = asyncio.create_task(_retry_once_after_ready())
+        self._restart_notify_retry_task = task
+        if getattr(self, "_background_tasks", None) is None:
+            self._background_tasks = set()
+        self._background_tasks.add(task)
+
+        def _done(t):
+            self._background_tasks.discard(t)
+            consume_detached_task_result(t)
+
+        task.add_done_callback(_done)
+
+    async def _send_restart_notification(
+        self,
+        *,
+        _expected_marker_text: Optional[str] = None,
+        _schedule_degraded_retry: bool = True,
+    ) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""
         notify_path = _hermes_home / ".restart_notify.json"
         if not notify_path.exists():
             return None
 
+        cleanup_marker = True
+        marker_text: Optional[str] = None
         try:
-            data = json.loads(notify_path.read_text())
+            marker_text = notify_path.read_text(encoding="utf-8")
+            if _expected_marker_text is not None and marker_text != _expected_marker_text:
+                # A newer /restart marker was written while a bounded retry for
+                # an older marker was pending. Leave the new marker for the next
+                # boot/owner rather than sending or deleting the wrong notice.
+                cleanup_marker = False
+                return None
+
+            data = json.loads(marker_text)
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             chat_type = data.get("chat_type")
@@ -16907,6 +16998,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id,
                     getattr(result, "error", "send returned success=False"),
                 )
+                if (
+                    _schedule_degraded_retry
+                    and self._is_restart_notify_send_path_degraded(result)
+                ):
+                    cleanup_marker = False
+                    self._schedule_restart_notification_retry(adapter, marker_text)
                 return None
 
             logger.info(
@@ -16919,7 +17016,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Restart notification failed: %s", e)
             return None
         finally:
-            notify_path.unlink(missing_ok=True)
+            if cleanup_marker:
+                self._cleanup_restart_notify_marker(
+                    notify_path,
+                    _expected_marker_text if _expected_marker_text is not None else marker_text,
+                )
 
     async def _send_home_channel_startup_notifications(
         self,
