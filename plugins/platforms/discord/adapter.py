@@ -942,6 +942,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # the bot in the channel when the user deliberately picked text-only
         # (/voice off) instead of leaving (/voice leave).
         self._voice_mode_getter: Optional[Callable] = None  # set by run.py
+        # Lets the inactivity timer defer disconnect while a voice-originated
+        # agent turn is still running, when configured to do so.
+        self._voice_busy_getter: Optional[Callable[[int], bool]] = None  # set by run.py
+        self._voice_disconnect_while_busy = self._load_voice_disconnect_while_busy()
         # Phase 3: continuous voice mixer (ambient idle bed + ducked speech).
         # Installed once per guild on join; lets acks / TTS / the "thinking"
         # loop overlap in one outgoing stream instead of stop-and-swap.
@@ -3792,6 +3796,25 @@ class DiscordAdapter(BasePlatformAdapter):
             minimum=0,
         )
 
+    def _load_voice_disconnect_while_busy(self) -> bool:
+        """Return whether inactivity may disconnect during voice-originated work."""
+        extra = self.config.extra if isinstance(getattr(self.config, "extra", None), dict) else {}
+        timeout_cfg = extra.get("voice_channel_inactivity_timeout")
+        raw = None
+        if isinstance(timeout_cfg, dict):
+            raw = timeout_cfg.get("disconnect_while_busy")
+        if raw is None:
+            return True
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        return True
+
     def _load_playback_timeout(self) -> int:
         """Return minimum playback wait seconds for Discord VC audio."""
         return self._load_discord_int_config(
@@ -4226,6 +4249,18 @@ class DiscordAdapter(BasePlatformAdapter):
         if text_ch_id is not None and _mode_getter is not None:
             try:
                 if _mode_getter(str(text_ch_id)) == "off":
+                    return
+            except Exception:
+                pass
+        _busy_getter = getattr(self, "_voice_busy_getter", None)
+        if not getattr(self, "_voice_disconnect_while_busy", True) and callable(_busy_getter):
+            try:
+                if _busy_getter(guild_id):
+                    logger.debug(
+                        "Deferring Discord VC inactivity disconnect while busy (guild=%d)",
+                        guild_id,
+                    )
+                    self._reset_voice_timeout(guild_id)
                     return
             except Exception:
                 pass

@@ -2297,7 +2297,8 @@ class TestPlaybackTimeout:
         assert hasattr(DiscordAdapter, "PLAYBACK_TIMEOUT")
         assert DiscordAdapter.PLAYBACK_TIMEOUT > 0
 
-    def test_voice_playback_passes_resolved_ffmpeg_executable(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_voice_playback_passes_resolved_ffmpeg_executable(self, monkeypatch):
         """discord.py playback should receive the resolved ffmpeg path via executable=."""
         from plugins.platforms.discord import adapter as discord_adapter
 
@@ -2310,14 +2311,14 @@ class TestPlaybackTimeout:
         adapter._voice_clients[111] = mock_vc
         adapter._voice_timeout_tasks[111] = MagicMock()
 
-        monkeypatch.setattr(discord_adapter, "resolve_ffmpeg_executable", lambda: r"C:\tools\ffmpeg.exe")
+        monkeypatch.setattr(discord_adapter, "resolve_ffmpeg_executable", lambda: r"C:\\tools\\ffmpeg.exe")
 
         with patch("discord.FFmpegPCMAudio") as ffmpeg_audio, \
              patch("discord.PCMVolumeTransformer", side_effect=lambda source, **_kw: source):
-            result = asyncio.run(adapter.play_in_voice_channel(111, "/tmp/test.mp3"))
+            result = await adapter.play_in_voice_channel(111, "/tmp/test.mp3")
 
         assert result is True
-        ffmpeg_audio.assert_called_once_with("/tmp/test.mp3", executable=r"C:\tools\ffmpeg.exe")
+        ffmpeg_audio.assert_called_once_with("/tmp/test.mp3", executable=r"C:\\tools\\ffmpeg.exe")
 
     @pytest.mark.asyncio
     async def test_playback_timeout_fires(self):
