@@ -1592,6 +1592,8 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = channel_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
+                if "voice_channel_inactivity_timeout" in platform_cfg:
+                    bridged["voice_channel_inactivity_timeout"] = platform_cfg["voice_channel_inactivity_timeout"]
                 if "typing_indicator" in platform_cfg:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:

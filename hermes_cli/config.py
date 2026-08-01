@@ -2720,6 +2720,13 @@ DEFAULT_CONFIG = {
         # Discord voice-channel inactivity timeout, in seconds. Set to 0 to
         # keep the bot in VC until an explicit `/voice leave` / disconnect.
         "voice_channel_inactivity_timeout_seconds": 300,
+        # Advanced inactivity-timeout options. Defaults preserve historical
+        # behavior: the timeout may disconnect even while a long voice-originated
+        # agent turn is still running. Set `disconnect_while_busy: false` to
+        # defer that disconnect until the in-flight voice turn finishes.
+        "voice_channel_inactivity_timeout": {
+            "disconnect_while_busy": True,
+        },
         # Minimum seconds to wait for a VC playback before force-stopping it.
         # The adapter also probes clip duration and extends this floor by a
         # padding window, so long TTS readbacks are not cut at exactly 120s.
