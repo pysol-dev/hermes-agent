@@ -3186,8 +3186,11 @@ def _run_approval_gate(
             context that is NOT a cron session (e.g. a bare script with
             HERMES_INTERACTIVE unset) BLOCKS instead of auto-approving. The
             dangerous-command path keeps its historical fail-open default
-            (False); the plugin-escalation path opts in to fail-closed so a
-            plugin-flagged action never runs ungated without a human.
+            (False) only for processes genuinely outside the gateway; a
+            gateway-derived child with ``_HERMES_GATEWAY`` but no approval
+            context always fails closed. The plugin-escalation path opts in to
+            fail-closed so a plugin-flagged action never runs ungated without a
+            human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
 
@@ -3216,6 +3219,30 @@ def _run_approval_gate(
     is_gateway = _is_gateway_approval_context()
 
     if not is_cli and not is_gateway:
+        if env_var_enabled("_HERMES_GATEWAY"):
+            # Gateway-spawned subprocesses can inherit the process lineage
+            # marker without the context-local approval session. They are not
+            # genuinely standalone scripts, so the historical noninteractive
+            # fail-open path must not apply and stdin prompting would block the
+            # child runner instead of reaching the gateway user.
+            logger.warning(
+                "%s (pattern: %s): %s — _HERMES_GATEWAY is set but no "
+                "gateway approval session is available; BLOCKED (fail-closed).",
+                autoapprove_log_prefix, pattern_key, description,
+            )
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED: Approval required ({description}) but no "
+                    "gateway approval session is available for this "
+                    "gateway-derived process. The user has NOT consented to "
+                    "this action. Do NOT retry it, do NOT rephrase it, and "
+                    "do NOT attempt the same outcome via a different path."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+                "user_consent": False,
+            }
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":

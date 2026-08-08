@@ -235,6 +235,91 @@ class TestApproveAndCheckSession:
         assert is_approved(key, "rm") is True
 
 
+class TestApprovalGateGatewayMarker:
+    def _run_gate(self):
+        return approval_module._run_approval_gate(
+            pattern_key="test-danger-pattern",
+            description="test dangerous command",
+            display_target="test dangerous target",
+            cron_deny_message="cron denied",
+            autoapprove_log_prefix="test dangerous command",
+        )
+
+    def _isolate_gate(self, monkeypatch):
+        monkeypatch.setattr(
+            approval_module,
+            "get_current_session_key",
+            lambda default="default": "test-session",
+        )
+        monkeypatch.setattr(approval_module, "is_approved", lambda sk, pk: False)
+        monkeypatch.setattr(
+            approval_module, "is_current_session_yolo_enabled", lambda: False
+        )
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False, raising=False)
+        monkeypatch.setattr(approval_module, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(
+            approval_module, "_is_cron_approval_context", lambda: False
+        )
+        monkeypatch.setattr(
+            "tools.terminal_tool._get_approval_callback", lambda: None, raising=False
+        )
+        monkeypatch.setattr(
+            approval_module,
+            "prompt_dangerous_approval",
+            lambda *a, **k: pytest.fail(
+                "noninteractive gateway-marker child must not prompt on stdin"
+            ),
+        )
+
+    def test_standalone_noninteractive_legacy_context_remains_approved(self, monkeypatch):
+        self._isolate_gate(monkeypatch)
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
+
+        result = self._run_gate()
+
+        assert result == {"approved": True, "message": None}
+
+    def test_inherited_gateway_marker_without_session_fails_closed(self, monkeypatch):
+        self._isolate_gate(monkeypatch)
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
+
+        result = self._run_gate()
+
+        assert result["approved"] is False
+        assert "no gateway approval session is available" in result["message"].lower()
+        assert result["pattern_key"] == "test-danger-pattern"
+        assert result["description"] == "test dangerous command"
+
+    def test_true_gateway_context_uses_session_queue_not_no_session_block(self, monkeypatch):
+        self._isolate_gate(monkeypatch)
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+        monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: True)
+        pending = []
+        monkeypatch.setattr(
+            approval_module,
+            "submit_pending",
+            lambda session_key, payload: pending.append((session_key, payload)),
+        )
+
+        result = self._run_gate()
+
+        assert result["approved"] is False
+        assert result["status"] == "approval_required"
+        assert "no gateway approval session" not in result["message"].lower()
+        assert pending == [
+            (
+                "test-session",
+                {
+                    "command": "test dangerous target",
+                    "pattern_key": "test-danger-pattern",
+                    "description": "test dangerous command",
+                },
+            )
+        ]
+
+
 class TestSessionKeyContext:
     def test_context_session_key_overrides_process_env(self):
         token = approval_module.set_current_session_key("alice")
