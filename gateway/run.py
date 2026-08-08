@@ -6167,16 +6167,26 @@ class TurnRunner:
                         raise RuntimeError("send_exec_approval: loop unavailable")
                     _outcome = _approval_send_outcome(_approval_fut, timeout=15)
                     if _outcome == "sent":
+                        if ctx.source.platform == Platform.DISCORD:
+                            _mirror_data = dict(approval_data)
+                            _mirror_data["command"] = cmd
+                            safe_schedule_threadsafe(
+                                self._runner._mirror_discord_approval_to_telegram_home(
+                                    approval_data=_mirror_data,
+                                    session_key=_approval_session_key,
+                                    source_chat_id=ctx.source.chat_id,
+                                ),
+                                ctx._loop_for_step,
+                                logger=logger,
+                                log_message="Discord approval Telegram mirror scheduling error",
+                            )
                         return
                     if _outcome == "ambiguous":
                         # Timeout ≠ failure: the card may have posted with a
                         # late ack (slow platform API call or transient
-                        # connector backpressure). The prompt
-                        # registration stays alive, so a tap on the rendered
-                        # card still resolves; re-sending here is what
-                        # produced duplicate cards and an orphaned
-                        # "/approve: nothing pending" in live relay testing.
-                        # Skip the text fallback.
+                        # connector backpressure). The prompt registration
+                        # stays alive, but do not mirror an unconfirmed send or
+                        # fall back and create duplicate approval cards.
                         logger.warning(
                             "Button-based approval send timed out — treating "
                             "as possibly-delivered (no re-send; the prompt "
@@ -6844,6 +6854,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _shutdown_watchdog_done: Optional["threading.Event"] = None
     _platform_lock_takeover_on_start: bool = False
     _reconnect_watcher_task: Optional["asyncio.Task"] = None
+
+    async def _mirror_discord_approval_to_telegram_home(
+        self,
+        approval_data: dict,
+        session_key: str,
+        source_chat_id: Optional[str] = None,
+    ) -> bool:
+        """Best-effort mirror of a Discord exec approval to Telegram Home.
+
+        The Telegram buttons must resolve the same pending approval as the
+        Discord buttons, so the original Discord session key is forwarded
+        unchanged.  Missing Telegram config, adapter failure, and send errors
+        are logged with redaction and never affect the Discord approval path.
+        """
+        try:
+            telegram_config = self.config.platforms.get(Platform.TELEGRAM)
+            if not telegram_config or not getattr(telegram_config, "enabled", False):
+                logger.debug("Discord approval mirror skipped: Telegram platform is not enabled")
+                return False
+
+            home = getattr(telegram_config, "home_channel", None)
+            if home is None or getattr(home, "platform", None) != Platform.TELEGRAM:
+                logger.debug("Discord approval mirror skipped: Telegram home is not configured")
+                return False
+
+            adapter = self.adapters.get(Platform.TELEGRAM)
+            send_exec_approval = getattr(adapter, "send_exec_approval", None)
+            if adapter is None or send_exec_approval is None:
+                logger.warning("Discord approval mirror skipped: Telegram adapter is unavailable")
+                return False
+
+            description = str(approval_data.get("description") or "dangerous command")
+            discord_hint = str(source_chat_id or "unknown")
+            mirrored_description = (
+                f"{description}\n\n"
+                f"Mirrored from Discord chat {discord_hint}; approval also remains in Discord."
+            )
+
+            metadata: Dict[str, Any] = {}
+            if getattr(home, "thread_id", None):
+                metadata["thread_id"] = str(home.thread_id)
+            if getattr(home, "user_id", None):
+                metadata["user_id"] = str(home.user_id)
+            if getattr(home, "scope_id", None):
+                metadata["scope_id"] = str(home.scope_id)
+
+            result = await send_exec_approval(
+                chat_id=str(home.chat_id),
+                command=str(approval_data.get("command") or ""),
+                session_key=session_key,
+                description=mirrored_description,
+                metadata=metadata or None,
+                allow_permanent=approval_data.get("allow_permanent", True),
+                allow_session=approval_data.get("allow_session", True),
+                smart_denied=approval_data.get("smart_denied", False),
+            )
+            if getattr(result, "success", False):
+                logger.info("Mirrored Discord exec approval to Telegram home")
+                return True
+
+            logger.warning(
+                "Discord approval mirror to Telegram home failed: %s",
+                _redact_gateway_user_facing_secrets(str(getattr(result, "error", "unknown error"))),
+            )
+            return False
+        except Exception as exc:
+            logger.warning(
+                "Discord approval mirror to Telegram home failed: %s",
+                _redact_gateway_user_facing_secrets(str(exc)),
+            )
+            return False
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref

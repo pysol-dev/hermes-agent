@@ -6236,6 +6236,90 @@ class TelegramAdapter(BasePlatformAdapter):
     def _ea_escape(self, text: str) -> str:
         return _html.escape(text)
 
+    @staticmethod
+    def _ea_clip_with_marker(text: str, raw_chars: int, marker: str) -> str:
+        text = str(text or "")
+        if raw_chars >= len(text):
+            return text
+        if raw_chars <= 0:
+            return marker.strip()
+        return text[:raw_chars] + marker
+
+    def _ea_render_html_approval(self, command: str, description: str, smart_denied: bool) -> str:
+        text = (
+            f"{self._EA_HEADER}"
+            f"{self._EA_CODE_OPEN}{self._ea_escape(command)}{self._EA_CODE_CLOSE}"
+            f"{self._EA_REASON_LABEL}{self._ea_escape(description)}"
+        )
+        if smart_denied:
+            text += self._EA_SMART_DENY_LINE
+        return text
+
+    def _ea_best_field_len(
+        self,
+        source: str,
+        marker: str,
+        render,
+        upper: Optional[int] = None,
+    ) -> int:
+        upper = min(len(source), upper if upper is not None else len(source))
+        lo, hi, best = 0, upper, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = self._ea_clip_with_marker(source, mid, marker)
+            if utf16_len(render(candidate)) <= self.MAX_MESSAGE_LENGTH:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    def _format_exec_approval(
+        self,
+        command: str,
+        description: str = "dangerous command",
+        smart_denied: bool = False,
+    ) -> str:
+        """Render Telegram HTML approval text within Bot API's 4096-unit cap."""
+        command_source = str(command or "")
+        description_source = str(description or "dangerous command")
+        command_marker = "\n… [truncated]"
+        description_marker = " … [truncated]"
+
+        text = self._ea_render_html_approval(command_source, description_source, smart_denied)
+        if utf16_len(text) <= self.MAX_MESSAGE_LENGTH:
+            return text
+
+        # Keep the reason readable but bounded while maximizing the command
+        # preview; the final pass then expands the reason into any remaining
+        # space.  All clipping happens before HTML escaping so tags/entities stay
+        # well-formed and inline keyboard callback data is unaffected.
+        reserve_desc_upper = min(len(description_source), 700)
+        desc_reserved = self._ea_clip_with_marker(
+            description_source,
+            self._ea_best_field_len(
+                description_source,
+                description_marker,
+                lambda d: self._ea_render_html_approval("", d, smart_denied),
+                reserve_desc_upper,
+            ),
+            description_marker,
+        )
+        cmd_len = self._ea_best_field_len(
+            command_source,
+            command_marker,
+            lambda c: self._ea_render_html_approval(c, desc_reserved, smart_denied),
+            self._EA_CMD_BUDGET,
+        )
+        command_preview = self._ea_clip_with_marker(command_source, cmd_len, command_marker)
+        desc_len = self._ea_best_field_len(
+            description_source,
+            description_marker,
+            lambda d: self._ea_render_html_approval(command_preview, d, smart_denied),
+        )
+        description_preview = self._ea_clip_with_marker(description_source, desc_len, description_marker)
+        return self._ea_render_html_approval(command_preview, description_preview, smart_denied)
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
