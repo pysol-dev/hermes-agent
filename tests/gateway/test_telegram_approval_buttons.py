@@ -48,6 +48,7 @@ _ensure_telegram_mock()
 
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import utf16_len
 
 
 def _make_adapter(extra=None):
@@ -175,6 +176,33 @@ class TestTelegramExecApproval:
             ["✅ Allow Once", "❌ Deny"],
         ]
 
+    @pytest.mark.asyncio
+    async def test_oversized_approval_is_truncated_with_valid_html_and_buttons(self):
+        adapter = _make_adapter()
+        sent = {}
+
+        async def mock_send_message(**kwargs):
+            sent.update(kwargs)
+            assert utf16_len(kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
+            return SimpleNamespace(message_id=42)
+
+        adapter._send_message_with_thread_fallback = AsyncMock(side_effect=mock_send_message)
+
+        result = await adapter.send_exec_approval(
+            chat_id="12345",
+            command=("printf '<secret & value>' && " * 500),
+            session_key="discord:session:key",
+            description=("dangerous reason with <b>markup</b> & details " * 500),
+        )
+
+        assert result.success is True
+        assert sent["parse_mode"] == "HTML"
+        assert sent["reply_markup"] is not None
+        assert utf16_len(sent["text"]) <= adapter.MAX_MESSAGE_LENGTH
+        assert "<pre>" in sent["text"] and "</pre>" in sent["text"]
+        assert "[truncated]" in sent["text"]
+        assert "&lt;" in sent["text"] and "&amp;" in sent["text"]
+        assert "<secret" not in sent["text"]
 
     @pytest.mark.asyncio
     async def test_send_update_prompt_escapes_dynamic_prompt(self):
