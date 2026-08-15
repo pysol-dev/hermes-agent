@@ -6,6 +6,7 @@ Built-in TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
+- Local HTTP (local): OpenAI-compatible /audio/speech sidecar
 - MiniMax TTS: High-quality with voice cloning, needs the selected region's key
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
@@ -283,6 +284,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
     "piper": 5000,        # local VITS model, phoneme-based; practical cap
+    "local_http": 5000,   # OpenAI-compatible sidecars vary; keep a safe default
 }
 
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
@@ -780,6 +782,7 @@ BUILTIN_TTS_PROVIDERS = frozenset({
     "kittentts",
     "piper",
     "deepinfra",
+    "local_http",
 })
 
 DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS = 120
@@ -2767,6 +2770,114 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
 
 
 # ===========================================================================
+# Local HTTP (OpenAI-compatible local sidecar)
+# ===========================================================================
+
+def _local_http_tts_config(tts_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return normalized config for the local OpenAI-compatible TTS sidecar."""
+    cfg = dict(_get_provider_section(tts_config, "local_http"))
+    base_url = str(cfg.get("base_url") or "http://127.0.0.1:8020/v1").rstrip("/")
+    endpoint = str(cfg.get("endpoint") or "").strip()
+    if not endpoint:
+        endpoint = f"{base_url}/audio/speech"
+    cfg["endpoint"] = endpoint
+    cfg.setdefault("model", "xtts-v2")
+    cfg.setdefault("voice", "default")
+    cfg.setdefault("timeout", 120)
+    return cfg
+
+
+def _local_http_response_format(output_path: str, cfg: Dict[str, Any]) -> str:
+    raw = cfg.get("response_format") or Path(output_path).suffix.lstrip(".") or "mp3"
+    fmt = str(raw).strip().lower()
+    if fmt == "ogg":
+        return "opus"
+    return fmt or "mp3"
+
+
+def _generate_local_http_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate TTS via a local OpenAI-compatible HTTP /audio/speech endpoint."""
+    import requests
+
+    cfg = _local_http_tts_config(tts_config)
+    response_format = _local_http_response_format(output_path, cfg)
+    payload: Dict[str, Any] = {
+        "model": str(cfg.get("model") or "xtts-v2"),
+        "input": text,
+        "voice": str(cfg.get("voice") or "default"),
+        "response_format": response_format,
+    }
+    extra_body = cfg.get("extra_body")
+    if isinstance(extra_body, dict):
+        payload.update(extra_body)
+
+    headers: Dict[str, str] = {"Accept": "audio/*"}
+    api_key = str(cfg.get("api_key") or "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response = requests.post(
+        str(cfg["endpoint"]),
+        json=payload,
+        headers=headers,
+        timeout=float(cfg.get("timeout") or 120),
+    )
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code < 200 or status_code >= 300:
+        body = _read_tts_response_bytes(
+            response,
+            label="local_http TTS error",
+            limit=64 * 1024,
+        )
+        detail = body.decode("utf-8", errors="replace")[:500] if body else ""
+        raise RuntimeError(f"local_http TTS HTTP {status_code}: {detail}".rstrip())
+
+    _write_tts_response_to_file(response, output_path, label="local_http TTS")
+    return output_path
+
+
+def _check_local_http_available(tts_config: Dict[str, Any]) -> bool:
+    """Probe the local sidecar readiness endpoint without synthesizing audio."""
+    try:
+        import requests
+    except Exception:
+        return False
+
+    cfg = _local_http_tts_config(tts_config)
+    endpoint = str(cfg.get("endpoint") or "")
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+
+    base_url = str(cfg.get("base_url") or "").rstrip("/")
+    candidates = []
+    if base_url:
+        candidates.extend([f"{base_url}/models", f"{base_url}/health", f"{base_url}/"])
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    candidates.extend([f"{root}/health", f"{root}/"])
+
+    headers: Dict[str, str] = {}
+    api_key = str(cfg.get("api_key") or "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    seen: set[str] = set()
+    for url in candidates:
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            response = requests.get(url, headers=headers or None, timeout=2)
+        except Exception:
+            continue
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        _close_response(response)
+        if 200 <= status_code < 500:
+            return True
+    return False
+
+
+# ===========================================================================
 # NeuTTS (local, on-device TTS via neutts_cli)
 # ===========================================================================
 
@@ -3238,7 +3349,7 @@ def _text_to_speech_single(
             file_path = out_dir / f"tts_{timestamp}.{fmt}"
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
+        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini", "local_http"}:
             file_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
@@ -3305,6 +3416,10 @@ def _text_to_speech_single(
             logger.info("Generating speech with DeepInfra TTS...")
             _generate_deepinfra_tts(text, file_str, tts_config)
 
+        elif provider == "local_http":
+            logger.info("Generating speech with local HTTP TTS sidecar...")
+            _generate_local_http_tts(text, file_str, tts_config)
+
         elif provider == "minimax":
             logger.info("Generating speech with MiniMax TTS...")
             _generate_minimax_tts(text, file_str, tts_config)
@@ -3364,6 +3479,13 @@ def _text_to_speech_single(
                 }, ensure_ascii=False)
             logger.info("Generating speech with Piper (local)...")
             _generate_piper_tts(text, file_str, tts_config)
+
+        elif provider != "edge":
+            return json.dumps({
+                "success": False,
+                "error": f"Unsupported TTS provider: {provider}",
+                "provider": provider,
+            }, ensure_ascii=False)
 
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
@@ -3445,7 +3567,7 @@ def _text_to_speech_single(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
+        elif provider in {"elevenlabs", "openai", "mistral", "gemini", "local_http"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")
 
         file_size = os.path.getsize(file_str)
@@ -3543,6 +3665,27 @@ def text_to_speech_tool(
         provider = _get_provider(tts_config)
 
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
+    provider_known = (
+        command_provider_config is not None
+        or provider in BUILTIN_TTS_PROVIDERS
+        or _get_named_provider_config(tts_config, provider)
+    )
+    if not provider_known:
+        try:
+            from agent.tts_registry import get_provider
+            from hermes_cli.plugins import _ensure_plugins_discovered
+
+            _ensure_plugins_discovered()
+            provider_known = get_provider(provider) is not None
+        except Exception:
+            provider_known = False
+    if not provider_known:
+        return json.dumps({
+            "success": False,
+            "error": f"Unsupported TTS provider: {provider}",
+            "provider": provider,
+        }, ensure_ascii=False)
+
     max_len = _resolve_max_text_length(provider, tts_config)
     chunks = _split_text_for_tts(text, max_len)
     if not chunks:
@@ -3594,7 +3737,7 @@ def text_to_speech_tool(
         if command_provider_config is not None:
             fmt = _get_command_tts_output_format(command_provider_config)
             base_path = out_dir / f"tts_{timestamp}.{fmt}"
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
+        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini", "local_http"}:
             base_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             base_path = out_dir / f"tts_{timestamp}.mp3"
@@ -3765,6 +3908,8 @@ def check_tts_requirements() -> bool:
         return _check_kittentts_available()
     if provider == "piper":
         return _check_piper_available()
+    if provider == "local_http":
+        return _check_local_http_available(tts_config)
 
     try:
         from agent.tts_registry import get_provider

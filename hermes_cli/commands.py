@@ -148,6 +148,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[all] [reason]", busy_policy="dispatch"),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg", "btw"), args_hint="<prompt>", busy_policy="dispatch"),
+    CommandDef("ask", "Run a prompt immediately in the foreground", "Session",
+               args_hint="<prompt>", busy_policy="reject"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),
     CommandDef("journey", "Open the learning journey timeline",
