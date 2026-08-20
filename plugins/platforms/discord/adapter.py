@@ -8820,6 +8820,7 @@ def _define_discord_view_classes() -> None:
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             self.workspace_id = workspace_id
+            self.effects_page = 0
             self._rebuild_buttons()
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
@@ -8874,10 +8875,15 @@ def _define_discord_view_classes() -> None:
             except Exception:
                 controls = []
                 button_labels = lambda ctrl, state=None: (f"− {ctrl.label} {ctrl.default}/10", f"+ {ctrl.label} {ctrl.default}/10")
-            # Workspace cards reserve row 0 for candidate selection and row 4 for
-            # reset/promote.  The full control state is still shown in the embed;
-            # direct /voiceclone panel (no workspace) renders all controls.
-            controls_to_render = controls[:6] if has_workspace else controls
+            controls_per_page = 6
+            page_count = 1
+            if has_workspace:
+                page_count = max(1, (len(controls) + controls_per_page - 1) // controls_per_page)
+                self.effects_page = max(0, min(self.effects_page, page_count - 1))
+                page_start = self.effects_page * controls_per_page
+                controls_to_render = controls[page_start:page_start + controls_per_page]
+            else:
+                controls_to_render = controls
             for idx, ctrl in enumerate(controls_to_render):
                 row = min(4, (idx // 2) + (1 if has_workspace else 0))
                 minus_label, plus_label = button_labels(ctrl, state)
@@ -8887,6 +8893,27 @@ def _define_discord_view_classes() -> None:
                 plus.callback = self._make_callback(ctrl.key, 1)
                 self.add_item(minus)
                 self.add_item(plus)
+            if has_workspace and page_count > 1:
+                previous_page = max(0, self.effects_page - 1)
+                next_page = min(page_count - 1, self.effects_page + 1)
+                previous = discord.ui.Button(
+                    label=f"◀ Effects {self.effects_page + 1}/{page_count}",
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"vcpag:{self.workspace_id}:{previous_page}",
+                    row=4,
+                    disabled=self.effects_page == 0,
+                )
+                next_button = discord.ui.Button(
+                    label=f"Effects {self.effects_page + 1}/{page_count} ▶",
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"vcpag:{self.workspace_id}:{next_page}",
+                    row=4,
+                    disabled=self.effects_page == page_count - 1,
+                )
+                previous.callback = self._make_page_callback(previous_page)
+                next_button.callback = self._make_page_callback(next_page)
+                self.add_item(previous)
+                self.add_item(next_button)
             reset = discord.ui.Button(label="Reset safe baseline", style=discord.ButtonStyle.danger, custom_id=f"vcreset:{self.workspace_id or '-'}", row=4)
             reset.callback = self._reset_callback
             self.add_item(reset)
@@ -8898,6 +8925,16 @@ def _define_discord_view_classes() -> None:
         def _make_callback(self, control: str, delta: int):
             async def _callback(interaction: discord.Interaction):
                 await self._adjust(interaction, control, delta)
+            return _callback
+
+        def _make_page_callback(self, page: int):
+            async def _callback(interaction: discord.Interaction):
+                if not self._check_auth(interaction):
+                    await interaction.response.send_message("You're not authorized to browse voice effects~", ephemeral=True)
+                    return
+                self.effects_page = page
+                self._rebuild_buttons()
+                await interaction.response.edit_message(view=self)
             return _callback
 
         def _make_candidate_callback(self, index: int):
