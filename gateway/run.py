@@ -2460,7 +2460,11 @@ from gateway.session_state import (
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
-from gateway.slash_commands import GatewaySlashCommandsMixin
+from gateway.slash_commands import (
+    GatewaySlashCommandsMixin,
+    has_voiceclone_intent,
+    voiceclone_media_paths,
+)
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -14674,6 +14678,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "yolo": self._handle_yolo_command,
                 "verbose": self._handle_verbose_command,
                 "footer": self._handle_footer_command,
+                "voiceclone": self._handle_voiceclone_command,
                 "help": self._handle_help_command,
                 "commands": self._handle_commands_command,
                 "profile": self._handle_profile_command,
@@ -15627,6 +15632,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
 
+        if not command and has_voiceclone_intent(event.text or "") and voiceclone_media_paths(event):
+            return await self._handle_voiceclone_command(event)
+
         # Expand alias quick commands before built-in dispatch so targets like
         # /model openai/gpt-5.5 --provider openrouter reach the /model handler.
         # Preserve built-in precedence; aliases only need early handling when
@@ -16058,6 +16066,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
+
+        if canonical == "voiceclone":
+            return await self._handle_voiceclone_command(event)
 
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
