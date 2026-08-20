@@ -69,6 +69,58 @@ def _int_value(value: Any) -> int:
         return 0
 
 
+_VOICECLONE_INTENT_RE = re.compile(
+    r"\b(clone|copy|make|create|build|generate)\b.{0,60}\b(voice|speaker)\b|"
+    r"\b(voice|speaker)\b.{0,60}\b(clone|cloned|copy|copied)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def has_voiceclone_intent(text: str) -> bool:
+    return bool(_VOICECLONE_INTENT_RE.search(text or ""))
+
+
+def voiceclone_media_paths(event: MessageEvent) -> list[tuple[str, str]]:
+    """Return supported local audio/video attachments for voice-clone curation."""
+    try:
+        from tools.voice_clone_curation import is_supported_media
+    except Exception:
+        return []
+    media_types = getattr(event, "media_types", None) or []
+    out: list[tuple[str, str]] = []
+    for i, path in enumerate(getattr(event, "media_urls", None) or []):
+        mtype = str(media_types[i]) if i < len(media_types) else ""
+        if is_supported_media(path, mtype):
+            out.append((path, mtype))
+    return out
+
+
+def parse_voiceclone_args(args: str) -> tuple[str | None, str | None]:
+    """Parse a friendly name plus optional target timestamp/hint."""
+    import shlex as _shlex
+
+    try:
+        tokens = _shlex.split(args or "")
+    except ValueError:
+        tokens = (args or "").split()
+    name_parts: list[str] = []
+    target_parts: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in {"--target", "--target-hint", "--at", "at"} and i + 1 < len(tokens):
+            target_parts.append(tokens[i + 1])
+            i += 2
+            continue
+        if tok.startswith("--target="):
+            target_parts.append(tok.split("=", 1)[1])
+            i += 1
+            continue
+        name_parts.append(tok)
+        i += 1
+    return (" ".join(name_parts).strip() or None, " ".join(target_parts).strip() or None)
+
+
 def _model_switch_skew_guard() -> Optional[str]:
     """Refuse a model switch when the gateway is running stale code.
 
@@ -3414,6 +3466,63 @@ class GatewaySlashCommandsMixin:
                 t("gateway.voice.help_channels") if supports_voice_channels else ""
             )
             return t("gateway.voice.help", toggle=toggle_line, channels=channels)
+
+    async def _handle_voiceclone_command(self, event: MessageEvent) -> str:
+        """Run/open the local voice-clone curation and audition workflow."""
+        adapter = (getattr(self, "adapters", {}) or {}).get(event.source.platform)
+        metadata = self._thread_metadata_for_source(event.source)  # type: ignore[attr-defined]
+        media_paths = voiceclone_media_paths(event)
+        if media_paths:
+            try:
+                from tools.voice_clone_workspace import create_voice_clone_workspace, render_workspace_text
+
+                chat_key = self._session_key_for_source(event.source)  # type: ignore[attr-defined]
+                requested_name, target_hint = parse_voiceclone_args(event.get_command_args().strip())
+                workspace = create_voice_clone_workspace(
+                    media_paths[0][0],
+                    chat_key=chat_key,
+                    requested_name=requested_name,
+                    target_hint=target_hint,
+                    mime_type=media_paths[0][1],
+                )
+                if adapter and hasattr(adapter, "send_voice_clone_panel"):
+                    result = await adapter.send_voice_clone_panel(
+                        str(event.source.chat_id),
+                        metadata=metadata,
+                        workspace=workspace,
+                    )
+                    if getattr(result, "success", False):
+                        if workspace.get("status") == "needs_source_candidate_selection":
+                            return "Voice media curated locally. I opened a panel so you can choose the target source candidate before audition/promotion."
+                        return "Voice clone workspace generated locally. I sent audition samples (when local TTS was available) and opened the candidate/effects panel."
+                    err = getattr(result, "error", "unknown error")
+                    return f"Voice clone workspace generated, but I couldn't open the interactive panel: {err}\n\n{render_workspace_text(workspace)}"
+                return render_workspace_text(workspace)
+            except Exception as exc:
+                logger.warning("voiceclone workflow failed: %s", exc, exc_info=True)
+                return f"Voice-clone workflow failed: {exc}"
+        try:
+            from tools.voice_clone_workspace import create_effect_draft_workspace, render_workspace_text
+
+            chat_key = self._session_key_for_source(event.source)  # type: ignore[attr-defined]
+            workspace = create_effect_draft_workspace(chat_key)
+        except Exception as exc:
+            logger.warning("voiceclone draft workspace failed: %s", exc, exc_info=True)
+            return f"Voice-clone controls unavailable: {exc}"
+        if adapter and hasattr(adapter, "send_voice_clone_panel"):
+            try:
+                result = await adapter.send_voice_clone_panel(
+                    str(event.source.chat_id),
+                    metadata=metadata,
+                    workspace=workspace,
+                )
+                if getattr(result, "success", False):
+                    return "Opened an inactive voice-clone effect draft. Browsing and effects do not change the active TTS voice/config."
+                err = getattr(result, "error", "unknown error")
+                return f"Couldn't open interactive voice-clone controls: {err}"
+            except Exception as exc:
+                logger.warning("voiceclone panel failed: %s", exc, exc_info=True)
+        return render_workspace_text(workspace)
 
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""

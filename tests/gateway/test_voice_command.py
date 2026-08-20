@@ -85,6 +85,43 @@ def _make_runner(tmp_path):
     return runner
 
 
+class TestVoiceCloneCommand:
+
+    def test_intent_aliases_and_attachment_filtering(self):
+        from gateway.slash_commands import has_voiceclone_intent, parse_voiceclone_args, voiceclone_media_paths
+        from hermes_cli.commands import resolve_command
+
+        event = SimpleNamespace(media_urls=["speaker.wav", "notes.txt"], media_types=None)
+
+        assert has_voiceclone_intent("Please clone this speaker voice")
+        assert not has_voiceclone_intent("Please summarize the attached audio")
+        assert voiceclone_media_paths(event) == [("speaker.wav", "")]
+        assert parse_voiceclone_args('Hayden --target "01:23"') == ("Hayden", "01:23")
+        assert resolve_command("voice-clone").name == "voiceclone"
+
+    @pytest.mark.asyncio
+    async def test_no_media_creates_inactive_effect_draft(self, tmp_path, monkeypatch):
+        from tools import voice_clone_curation as curation
+
+        monkeypatch.setattr(curation, "get_hermes_home", lambda: tmp_path)
+        runner = _make_runner(tmp_path)
+        event = _make_event("/voiceclone")
+        event.media_urls = []
+        event.media_types = []
+        runner._thread_metadata_for_source = lambda _source: {}
+        runner._session_key_for_source = lambda _source: "agent:main:telegram:group:123:user1"
+        adapter = SimpleNamespace(send_voice_clone_panel=AsyncMock(return_value=SimpleNamespace(success=True)))
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_voiceclone_command(event)
+
+        draft = adapter.send_voice_clone_panel.await_args.kwargs["workspace"]
+        assert draft["status"] == "effects_draft"
+        assert draft["target_selection"]["state"] == "needs_media"
+        assert "inactive" in result.lower()
+        assert not (tmp_path / "config.yaml").exists()
+
+
 # =====================================================================
 # /voice command handler
 # =====================================================================
