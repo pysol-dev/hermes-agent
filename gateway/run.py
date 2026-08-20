@@ -42,7 +42,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List, Union
+from typing import Dict, Optional, Any, List, Union, Tuple
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -12320,51 +12320,160 @@ class GatewayRunner:
 
         return True
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
-        """Generate TTS audio and send as a voice message before the text reply."""
+    def _split_tts_reply_chunks(self, text: str, *, max_chars: int = 520) -> List[str]:
+        """Split TTS text into sentence-ish chunks for lower voice latency.
+
+        Discord voice-channel playback can start as soon as the first chunk has
+        been synthesised instead of waiting for a whole long reply.  Keep this
+        conservative: only split on whitespace after punctuation when possible,
+        and hard-wrap pathological long spans.
+        """
+        if not text:
+            return []
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) <= max_chars:
+            return [text]
+
+        parts = re.split(r"(?<=[.!?。！？])\s+", text)
+        chunks: List[str] = []
+        current = ""
+
+        def _flush_current() -> None:
+            nonlocal current
+            if current.strip():
+                chunks.append(current.strip())
+            current = ""
+
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            while len(part) > max_chars:
+                # Prefer a recent comma/semicolon/space; otherwise hard split.
+                split_at = max(
+                    part.rfind(", ", 0, max_chars),
+                    part.rfind("; ", 0, max_chars),
+                    part.rfind(": ", 0, max_chars),
+                    part.rfind(" ", 0, max_chars),
+                )
+                if split_at < max_chars // 2:
+                    split_at = max_chars
+                prefix, part = part[:split_at].strip(), part[split_at:].strip()
+                if prefix:
+                    if current:
+                        _flush_current()
+                    chunks.append(prefix)
+            candidate = f"{current} {part}".strip() if current else part
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                _flush_current()
+                current = part
+        _flush_current()
+        return chunks
+
+    async def _synthesize_voice_reply_chunk(self, text: str, prefix: str) -> Tuple[Optional[str], Optional[str]]:
+        """Synthesize one TTS chunk and return (requested_path, actual_path)."""
         import uuid as _uuid
+        from tools.tts_tool import text_to_speech_tool
+
+        audio_path = os.path.join(
+            tempfile.gettempdir(), "hermes_voice",
+            f"{prefix}_{_uuid.uuid4().hex[:12]}.mp3",
+        )
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+        result_json = await asyncio.to_thread(
+            text_to_speech_tool, text=text, output_path=audio_path
+        )
+        try:
+            result = json.loads(result_json)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "Auto voice reply TTS returned invalid JSON: %s",
+                result_json[:200] if result_json else result_json,
+            )
+            return audio_path, None
+        actual_path = result.get("file_path", audio_path)
+        if not result.get("success") or not os.path.isfile(actual_path):
+            logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
+            return audio_path, None
+        return audio_path, actual_path
+
+    async def _play_chunked_voice_reply(self, adapter, guild_id: int, chunks: List[str]) -> None:
+        """Pipeline local TTS synthesis with Discord voice-channel playback.
+
+        While chunk N is playing through the adapter, chunk N+1 is already being
+        synthesised in a worker thread.  This reduces perceived latency for
+        long spoken replies without changing the provider or sending audio to a
+        cloud realtime API.
+        """
+        cleanup_paths: set[str] = set()
+        synth_task: Optional[asyncio.Task] = None
+        try:
+            for idx, chunk in enumerate(chunks):
+                if synth_task is None:
+                    synth_task = asyncio.create_task(
+                        self._synthesize_voice_reply_chunk(chunk, "tts_reply")
+                    )
+                requested_path, actual_path = await synth_task
+                for p in (requested_path, actual_path):
+                    if p:
+                        cleanup_paths.add(p)
+
+                next_idx = idx + 1
+                synth_task = None
+                if next_idx < len(chunks):
+                    synth_task = asyncio.create_task(
+                        self._synthesize_voice_reply_chunk(chunks[next_idx], "tts_reply")
+                    )
+
+                if actual_path:
+                    await adapter.play_in_voice_channel(guild_id, actual_path)
+        finally:
+            if synth_task is not None and not synth_task.done():
+                synth_task.cancel()
+            for p in cleanup_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
+        """Generate TTS audio and send/play it before the text reply."""
         audio_path = None
         actual_path = None
         try:
-            from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
+            from tools.tts_tool import _strip_markdown_for_tts
 
             tts_text = _strip_markdown_for_tts(text[:4000])
             if not tts_text:
                 return
 
-            # Use .mp3 extension so edge-tts conversion to opus works correctly.
-            # The TTS tool may convert to .ogg — use file_path from result.
-            audio_path = os.path.join(
-                tempfile.gettempdir(), "hermes_voice",
-                f"tts_reply_{_uuid.uuid4().hex[:12]}.mp3",
-            )
-            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-
-            result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=tts_text, output_path=audio_path
-            )
-            try:
-                result = json.loads(result_json)
-            except (json.JSONDecodeError, TypeError):
-                logger.warning("Auto voice reply TTS returned invalid JSON: %s", result_json[:200] if result_json else result_json)
-                return
-
-            # Use the actual file path from result (may differ after opus conversion)
-            actual_path = result.get("file_path", audio_path)
-            if not result.get("success") or not os.path.isfile(actual_path):
-                logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
-                return
-
             adapter = self.adapters.get(event.source.platform)
 
-            # If connected to a voice channel, play there instead of sending a file
+            # If connected to a voice channel, play there instead of sending a
+            # file.  Long replies are chunked/pipelined so speech starts after
+            # the first short chunk rather than after the full reply is rendered.
             guild_id = self._get_guild_id(event)
             if (guild_id
                     and hasattr(adapter, "play_in_voice_channel")
                     and hasattr(adapter, "is_in_voice_channel")
                     and adapter.is_in_voice_channel(guild_id)):
-                await adapter.play_in_voice_channel(guild_id, actual_path)
-            elif adapter and hasattr(adapter, "send_voice"):
+                chunks = self._split_tts_reply_chunks(tts_text)
+                if chunks:
+                    await self._play_chunked_voice_reply(adapter, guild_id, chunks)
+                return
+
+            # _synthesize_voice_reply_chunk uses uuid-based temp filenames so
+            # concurrent voice replies cannot collide.
+            # Non-VC platforms/chats still need one deliverable audio file.
+            audio_path, actual_path = await self._synthesize_voice_reply_chunk(
+                tts_text, "tts_reply"
+            )
+            if not actual_path:
+                return
+
+            if adapter and hasattr(adapter, "send_voice"):
                 reply_anchor = self._reply_anchor_for_event(event)
                 thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
                 # Mark the auto voice reply as notify-worthy.  Mirrors the
@@ -12389,7 +12498,9 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
-            for p in {audio_path, actual_path} - {None}:
+            for p in (audio_path, actual_path):
+                if not p:
+                    continue
                 try:
                     os.unlink(p)
                 except OSError:

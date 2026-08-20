@@ -176,6 +176,10 @@ DEFAULT_KITTENTTS_VOICE = "Jasper"
 DEFAULT_PIPER_VOICE = "en_US-lessac-medium"  # balanced size/quality
 DEFAULT_OPENAI_VOICE = "alloy"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_LOCAL_HTTP_BASE_URL = "http://127.0.0.1:8020/v1"
+DEFAULT_LOCAL_HTTP_MODEL = "xtts-v2"
+DEFAULT_LOCAL_HTTP_VOICE = "peach"
+DEFAULT_LOCAL_HTTP_TIMEOUT = 120
 DEFAULT_MINIMAX_MODEL = "speech-02-hd"
 DEFAULT_MINIMAX_VOICE_ID = "English_expressive_narrator"
 DEFAULT_MINIMAX_BASE_URL = "https://api.minimax.io/v1/t2a_v2"
@@ -358,6 +362,7 @@ BUILTIN_TTS_PROVIDERS = frozenset({
     "edge",
     "elevenlabs",
     "openai",
+    "local_http",
     "minimax",
     "xai",
     "mistral",
@@ -1023,6 +1028,50 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
         close = getattr(client, "close", None)
         if callable(close):
             close()
+
+
+# ===========================================================================
+# Provider: local HTTP OpenAI-compatible TTS
+# ===========================================================================
+def _generate_local_http_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate audio using a local OpenAI-compatible /audio/speech endpoint."""
+    import requests
+
+    cfg = _get_provider_section(tts_config, "local_http")
+    base_url = str(cfg.get("base_url") or DEFAULT_LOCAL_HTTP_BASE_URL).rstrip("/")
+    model = cfg.get("model") or DEFAULT_LOCAL_HTTP_MODEL
+    voice = cfg.get("voice") or DEFAULT_LOCAL_HTTP_VOICE
+    timeout = float(cfg.get("timeout") or DEFAULT_LOCAL_HTTP_TIMEOUT)
+    raw_extra_body = cfg.get("extra_body")
+    extra_body = raw_extra_body if isinstance(raw_extra_body, dict) else {}
+
+    if output_path.endswith(".ogg"):
+        response_format = "opus"
+    elif output_path.endswith(".wav"):
+        response_format = "wav"
+    elif output_path.endswith(".flac"):
+        response_format = "flac"
+    else:
+        response_format = "mp3"
+
+    payload = {
+        "model": model,
+        "voice": voice,
+        "input": text,
+        "response_format": response_format,
+    }
+    payload.update(extra_body)
+
+    response = requests.post(
+        f"{base_url}/audio/speech",
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    with open(output_path, "wb") as f:
+        f.write(response.content)
+    return output_path
 
 
 # ===========================================================================
@@ -1978,6 +2027,10 @@ def text_to_speech_tool(
                 }, ensure_ascii=False)
             logger.info("Generating speech with OpenAI TTS...")
             _generate_openai_tts(text, file_str, tts_config)
+
+        elif provider == "local_http":
+            logger.info("Generating speech with local HTTP TTS...")
+            _generate_local_http_tts(text, file_str, tts_config)
 
         elif provider == "minimax":
             logger.info("Generating speech with MiniMax TTS...")
