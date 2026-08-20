@@ -61,6 +61,14 @@ class _TextChannel:
         return _empty()
 
 
+class _SendCapableTextChannel(_TextChannel):
+    """Fake Discord text channel with a send method for failure notices."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.send = AsyncMock()
+
+
 class _Thread:
     """Fake Discord thread (not a DM, not a top-level channel)."""
 
@@ -202,24 +210,23 @@ class TestThreadStarterDedup:
 
 
     @pytest.mark.asyncio
-    async def test_no_dedup_seed_when_thread_creation_fails(self, adapter, monkeypatch):
-        """When _auto_create_thread returns None, no pre-seeding occurs.
+    async def test_bare_none_thread_creation_failure_fails_closed(self, adapter, monkeypatch):
+        """Bare/unknown None from _auto_create_thread fails closed without dedup seed.
 
         Auto-thread failure is now fail-closed (#20243): the agent is NOT
         invoked and the user gets a visible notice instead of a silent inline
-        reply. This test's contract is specifically about dedup pre-seeding —
-        the phantom thread id must not leak into the dedup cache when creation
+        reply. This test's contract is also about dedup pre-seeding — the
+        phantom thread id must not leak into the dedup cache when creation
         fails.
         """
         monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
         monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
 
-        channel = _TextChannel(channel_id=100)
-        channel.send = AsyncMock()
+        channel = _SendCapableTextChannel(channel_id=100)
         phantom_thread_id = 55555
 
         async def fake_auto_create_thread_fail(message):
-            return None  # thread creation failed
+            return None  # unknown legacy/bare failure, not classified unsupported-channel fallback
 
         monkeypatch.setattr(
             adapter, "_auto_create_thread", fake_auto_create_thread_fail
@@ -228,9 +235,8 @@ class TestThreadStarterDedup:
         user_msg = _make_message(msg_id=42, channel=channel, content="hello")
         await adapter._handle_message(user_msg)
 
-        # Fail-closed: the agent must NOT run when the required thread route
-        # could not be created (#20243).
         adapter.handle_message.assert_not_awaited()
+        channel.send.assert_awaited_once_with(discord_platform._AUTO_THREAD_FAILURE_NOTICE)
 
         # The phantom thread id should NOT be in the dedup cache
         assert str(phantom_thread_id) not in adapter._dedup._seen, (
