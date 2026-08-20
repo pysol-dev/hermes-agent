@@ -69,6 +69,43 @@ class _Snowflake:
     def __init__(self, id: int) -> None:  # noqa: A002 - matches discord API
         self.id = id
 
+
+class _AutoThreadCreationFailure:
+    """Internal sentinel for failed Discord auto-thread creation."""
+
+    __slots__ = ("direct_error", "fallback_error", "unsupported_channel")
+
+    def __init__(
+        self,
+        *,
+        direct_error: BaseException,
+        fallback_error: BaseException | None = None,
+        unsupported_channel: bool = False,
+    ) -> None:
+        self.direct_error = direct_error
+        self.fallback_error = fallback_error
+        self.unsupported_channel = unsupported_channel
+
+    def __bool__(self) -> bool:
+        return False
+
+
+_AUTO_THREAD_FAILURE_NOTICE = (
+    "⚠️ Hermes could not create a Discord thread for this message, "
+    "so the request was not processed. Please retry."
+)
+_AUTO_THREAD_UNSUPPORTED_CHANNEL_TEXT = "Cannot execute action on this channel type"
+
+
+def _is_unsupported_auto_thread_channel_error(error: BaseException) -> bool:
+    """Return True for Discord's deterministic unsupported thread-channel error."""
+    return (
+        getattr(error, "status", None) == 400
+        and getattr(error, "code", None) == 50024
+        and _AUTO_THREAD_UNSUPPORTED_CHANNEL_TEXT in str(error)
+    )
+
+
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
@@ -7214,11 +7251,11 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_name = thread_name[:77] + "..."
         return thread_name
 
-    async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
+    async def _auto_create_thread(self, message: 'DiscordMessage') -> Any:
         """Create a thread from a user message for auto-threading.
 
-        Returns the created thread object, or ``None`` on failure. Both the
-        primary ``message.create_thread`` and the seed-message fallback are
+        Returns the created thread object, or an internal failure sentinel. Both
+        the primary ``message.create_thread`` and the seed-message fallback are
         retried once after a short backoff so transient connect errors
         (e.g. ``Cannot connect to host discord.com:443``) don't immediately
         burn through to the caller's failure path (#20243).
@@ -7227,8 +7264,8 @@ class DiscordAdapter(BasePlatformAdapter):
         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
         reason = f"Auto-threaded from mention by {display_name}"
 
-        last_direct_error: Exception | None = None
-        last_fallback_error: Exception | None = None
+        last_direct_error: BaseException | None = None
+        last_fallback_error: BaseException | None = None
 
         for attempt in range(2):
             try:
@@ -7240,6 +7277,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 return thread
             except Exception as direct_error:
                 last_direct_error = direct_error
+                if _is_unsupported_auto_thread_channel_error(direct_error):
+                    return _AutoThreadCreationFailure(
+                        direct_error=direct_error,
+                        unsupported_channel=True,
+                    )
                 try:
                     seed_msg = await message.channel.send(
                         f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
@@ -7269,7 +7311,10 @@ class DiscordAdapter(BasePlatformAdapter):
             last_direct_error,
             last_fallback_error,
         )
-        return None
+        return _AutoThreadCreationFailure(
+            direct_error=last_direct_error or RuntimeError("unknown auto-thread creation failure"),
+            fallback_error=last_fallback_error,
+        )
 
     async def rename_thread(
         self,
@@ -8164,7 +8209,29 @@ class DiscordAdapter(BasePlatformAdapter):
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
-                if thread:
+                if isinstance(thread, _AutoThreadCreationFailure):
+                    if thread.unsupported_channel:
+                        logger.info(
+                            "[%s] Discord channel %s does not support auto-thread creation; processing inline",
+                            self.name,
+                            getattr(message.channel, "id", "unknown"),
+                        )
+                    else:
+                        # Auto-threading is the configured routing target for
+                        # this message. Non-deterministic failures (network,
+                        # rate limit, permissions, unknown errors) must fail
+                        # closed rather than leaking the request into a shared
+                        # parent channel (#20243).
+                        try:
+                            await message.channel.send(_AUTO_THREAD_FAILURE_NOTICE)
+                        except Exception as notify_error:
+                            logger.warning(
+                                "[%s] Failed to notify user of auto-thread failure: %s",
+                                self.name,
+                                notify_error,
+                            )
+                        return
+                elif thread:
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
                     thread_id = str(thread.id)
@@ -8181,18 +8248,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     # Fixes #51057.
                     self._dedup.is_duplicate(str(thread.id))
                 else:
-                    # Auto-threading is the configured routing target for this
-                    # message; if it fails we must NOT silently fall back to an
-                    # inline parent-channel reply (#20243). That breaks
-                    # thread-first Discord workflows by dumping a new task into
-                    # a shared channel. Surface a short visible error so the
-                    # user can retry once Discord recovers, and skip agent
-                    # invocation for this message.
+                    # Bare falsy failures are not deterministic channel-capability
+                    # failures, so fail closed rather than leaking the request into
+                    # a shared parent channel (#20243).
                     try:
-                        await message.channel.send(
-                            "⚠️ Hermes could not create a Discord thread for "
-                            "this message, so the request was not processed. Please retry."
-                        )
+                        await message.channel.send(_AUTO_THREAD_FAILURE_NOTICE)
                     except Exception as notify_error:
                         logger.warning(
                             "[%s] Failed to notify user of auto-thread failure: %s",

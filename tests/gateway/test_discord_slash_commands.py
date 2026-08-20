@@ -449,6 +449,62 @@ async def test_rename_thread_edits_only_when_current_name_matches(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_auto_create_thread_truncates_long_names(adapter):
+    long_text = "a" * 200
+    thread = SimpleNamespace(id=999, name="truncated")
+    message = SimpleNamespace(
+        content=long_text,
+        create_thread=AsyncMock(return_value=thread),
+        channel=SimpleNamespace(send=AsyncMock()),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    result = await adapter._auto_create_thread(message)
+
+    assert result is thread
+    call_kwargs = message.create_thread.await_args[1]
+    assert len(call_kwargs["name"]) <= 80
+    assert call_kwargs["name"].endswith("...")
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_falls_back_to_seed_message(adapter):
+    thread = SimpleNamespace(id=555, name="Hello")
+    seed_message = SimpleNamespace(create_thread=AsyncMock(return_value=thread))
+    message = SimpleNamespace(
+        content="Hello",
+        create_thread=AsyncMock(side_effect=RuntimeError("no perms")),
+        channel=SimpleNamespace(send=AsyncMock(return_value=seed_message)),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    result = await adapter._auto_create_thread(message)
+    assert result is thread
+    message.channel.send.assert_awaited_once_with("🧵 Thread created by Hermes: **Hello**")
+    seed_message.create_thread.assert_awaited_once_with(
+        name="Hello",
+        auto_archive_duration=1440,
+        reason="Auto-threaded from mention by Jezza",
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_create_thread_returns_failure_sentinel_when_direct_and_fallback_fail(adapter):
+    message = SimpleNamespace(
+        content="Hello",
+        create_thread=AsyncMock(side_effect=RuntimeError("no perms")),
+        channel=SimpleNamespace(send=AsyncMock(side_effect=RuntimeError("send failed"))),
+        author=SimpleNamespace(display_name="Jezza"),
+    )
+
+    result = await adapter._auto_create_thread(message)
+    assert result is not None
+    assert not result
+    assert result.unsupported_channel is False
+    assert str(result.direct_error) == "no perms"
+    assert str(result.fallback_error) == "send failed"
+
 # ------------------------------------------------------------------
 # Auto-thread integration in _handle_message
 # ------------------------------------------------------------------

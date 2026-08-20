@@ -61,6 +61,7 @@ class FakeTextChannel:
         self.name = name
         self.guild = SimpleNamespace(name=guild_name)
         self.topic = None
+        self.send = AsyncMock()
 
 
 class FakeThread:
@@ -71,6 +72,19 @@ class FakeThread:
         self.parent_id = getattr(parent, "id", None)
         self.guild = getattr(parent, "guild", None) or SimpleNamespace(name=guild_name)
         self.topic = None
+
+
+class FakeDiscordHTTPException(Exception):
+    """HTTPException-shaped test double with discord.py's status/code attrs."""
+
+    def __init__(self, *, status: int, code: int, text: str):
+        super().__init__(text)
+        self.status = status
+        self.code = code
+        self.text = text
+
+    def __str__(self):
+        return self.text
 
 
 @pytest.fixture
@@ -97,7 +111,22 @@ def make_message(*, channel, content: str, mentions=None):
         created_at=datetime.now(timezone.utc),
         channel=channel,
         author=author,
+        create_thread=AsyncMock(),
     )
+
+
+def configure_auto_thread(monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+
+AUTO_THREAD_FAILURE_NOTICE = (
+    "⚠️ Hermes could not create a Discord thread for this message, "
+    "so the request was not processed. Please retry."
+)
 
 
 # ── ignored_channels ─────────────────────────────────────────────────
@@ -214,6 +243,129 @@ async def test_auto_thread_failure_skips_agent_and_notifies_user(adapter, monkey
     sent_text = channel.send.await_args.args[0]
     assert "could not create" in sent_text.lower()
     assert "thread" in sent_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_success_routes_into_created_thread(adapter, monkeypatch):
+    """Successful auto-thread creation sends the agent event to the new thread."""
+    configure_auto_thread(monkeypatch)
+    parent = FakeTextChannel(channel_id=900, name="general")
+    thread = FakeThread(channel_id=901, name="auto-thread", parent=parent)
+    message = make_message(channel=parent, content="hello")
+    message.create_thread.return_value = thread
+
+    await adapter._handle_message(message)
+
+    message.create_thread.assert_awaited_once_with(name="hello", auto_archive_duration=1440)
+    parent.send.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "901"
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "901"
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_unsupported_channel_falls_back_inline_without_failure_notice(adapter, monkeypatch):
+    """Discord HTTP 400/code 50024 means this channel type cannot host threads.
+
+    That deterministic channel capability error should process the original
+    parent-channel message normally instead of failing closed.
+    """
+    configure_auto_thread(monkeypatch)
+    parent = FakeTextChannel(channel_id=900, name="announcements")
+    message = make_message(channel=parent, content="hello")
+    message.create_thread.side_effect = FakeDiscordHTTPException(
+        status=400,
+        code=50024,
+        text="Cannot execute action on this channel type",
+    )
+    parent.send.side_effect = AssertionError("unsupported-channel fallback should not post a failure notice")
+
+    await adapter._handle_message(message)
+
+    parent.send.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "900"
+    assert event.source.chat_type == "group"
+    assert event.source.thread_id is None
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_transient_failure_fails_closed_with_visible_notice(adapter, monkeypatch):
+    """Transient auto-thread errors must not leak the request into the parent channel."""
+    configure_auto_thread(monkeypatch)
+    parent = FakeTextChannel(channel_id=900, name="general")
+    seed_messages = [
+        SimpleNamespace(create_thread=AsyncMock(side_effect=RuntimeError("Cannot connect to host discord.com:443"))),
+        SimpleNamespace(create_thread=AsyncMock(side_effect=RuntimeError("Cannot connect to host discord.com:443"))),
+    ]
+    parent.send.side_effect = [seed_messages[0], seed_messages[1], None]
+    message = make_message(channel=parent, content="hello")
+    message.create_thread.side_effect = RuntimeError("Cannot connect to host discord.com:443")
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+    assert parent.send.await_args_list[-1].args == (AUTO_THREAD_FAILURE_NOTICE,)
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_permission_failure_fails_closed_with_visible_notice(adapter, monkeypatch):
+    """HTTP 403 permission errors are not safe to fall back inline."""
+    configure_auto_thread(monkeypatch)
+    parent = FakeTextChannel(channel_id=900, name="general")
+    permission_error = FakeDiscordHTTPException(status=403, code=50013, text="Missing Permissions")
+    seed_messages = [
+        SimpleNamespace(create_thread=AsyncMock(side_effect=permission_error)),
+        SimpleNamespace(create_thread=AsyncMock(side_effect=permission_error)),
+    ]
+    parent.send.side_effect = [seed_messages[0], seed_messages[1], None]
+    message = make_message(channel=parent, content="hello")
+    message.create_thread.side_effect = permission_error
+
+    await adapter._handle_message(message)
+
+    adapter.handle_message.assert_not_awaited()
+    assert parent.send.await_args_list[-1].args == (AUTO_THREAD_FAILURE_NOTICE,)
+
+
+@pytest.mark.asyncio
+async def test_no_thread_channels_csv_parsing(adapter, monkeypatch):
+    """Multiple no_thread channel IDs parsed from CSV."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "800, 900")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=999))
+
+    for ch_id in (800, 900):
+        adapter._auto_create_thread.reset_mock()
+        adapter.handle_message.reset_mock()
+        message = make_message(channel=FakeTextChannel(channel_id=ch_id), content="hello")
+        await adapter._handle_message(message)
+        adapter._auto_create_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_thread_with_auto_thread_disabled_is_noop(adapter, monkeypatch):
+    """no_thread_channels is a no-op when auto_thread is globally disabled."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.setenv("DISCORD_NO_THREAD_CHANNELS", "800")
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    adapter._auto_create_thread = AsyncMock()
+
+    message = make_message(channel=FakeTextChannel(channel_id=800), content="hello")
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
 
 
 # ── config.py bridging ───────────────────────────────────────────────
