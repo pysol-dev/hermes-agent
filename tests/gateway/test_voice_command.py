@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import logging
 import os
 import queue
 import sys
@@ -9,7 +10,7 @@ import threading
 import time
 import pytest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 
 def _ensure_discord_mock():
@@ -82,6 +83,132 @@ def _make_runner(tmp_path):
     runner.session_store = MagicMock()
     runner._is_user_authorized = lambda source: True
     return runner
+
+
+def _clear_discord_voice_timeout_env(monkeypatch):
+    monkeypatch.delenv("HERMES_DISCORD_VOICE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("HERMES_DISCORD_VOICE_TIMEOUT_DISCONNECT_WHILE_BUSY", raising=False)
+
+
+# =====================================================================
+# Discord voice inactivity timeout
+# =====================================================================
+
+class TestDiscordVoiceTimeout:
+
+    def test_yaml_bridge_seeds_voice_timeout_extra_and_env(self, monkeypatch):
+        _clear_discord_voice_timeout_env(monkeypatch)
+        from plugins.platforms.discord.adapter import _apply_yaml_config
+
+        seeded = _apply_yaml_config({}, {
+            "voice_timeout": {
+                "timeout_seconds": 1200,
+                "disconnect_while_busy": False,
+            }
+        })
+
+        assert seeded == {
+            "voice_timeout": {
+                "timeout_seconds": 1200,
+                "disconnect_while_busy": False,
+            }
+        }
+        assert os.environ["HERMES_DISCORD_VOICE_TIMEOUT_SECONDS"] == "1200"
+        assert os.environ["HERMES_DISCORD_VOICE_TIMEOUT_DISCONNECT_WHILE_BUSY"] == "false"
+
+    def test_timeout_seconds_from_config_is_honored(self, monkeypatch, caplog):
+        _clear_discord_voice_timeout_env(monkeypatch)
+        from gateway.config import PlatformConfig
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        caplog.set_level(logging.INFO, logger="plugins.platforms.discord.adapter")
+        adapter = DiscordAdapter(PlatformConfig(extra={
+            "voice_timeout": {
+                "timeout_seconds": 1200,
+                "disconnect_while_busy": False,
+            }
+        }))
+
+        assert adapter.VOICE_TIMEOUT == 1200
+        assert adapter._voice_timeout_disconnect_while_busy is False
+        assert (
+            "[Discord] Voice timeout config loaded "
+            "(timeout_seconds=1200, disconnect_while_busy=False, source=config)"
+            in caplog.text
+        )
+
+    def test_voice_timeout_loaded_state_log_reports_defaults(self, monkeypatch, caplog):
+        _clear_discord_voice_timeout_env(monkeypatch)
+        from gateway.config import PlatformConfig
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        caplog.set_level(logging.INFO, logger="plugins.platforms.discord.adapter")
+        adapter = DiscordAdapter(PlatformConfig(extra={}))
+
+        assert adapter.VOICE_TIMEOUT == 300
+        assert adapter._voice_timeout_disconnect_while_busy is False
+        assert (
+            "[Discord] Voice timeout config loaded "
+            "(timeout_seconds=300, disconnect_while_busy=False, source=defaults)"
+            in caplog.text
+        )
+
+    def test_timeout_seconds_zero_disables_scheduling(self, monkeypatch):
+        _clear_discord_voice_timeout_env(monkeypatch)
+        from gateway.config import PlatformConfig
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = DiscordAdapter(PlatformConfig(extra={
+            "voice_timeout": {"timeout_seconds": 0}
+        }))
+
+        adapter._reset_voice_timeout(42)
+
+        assert adapter._voice_timeout_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_timeout_during_playback_does_not_leave_and_rearms(self, monkeypatch):
+        _clear_discord_voice_timeout_env(monkeypatch)
+        from gateway.config import PlatformConfig
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = DiscordAdapter(PlatformConfig(extra={
+            "voice_timeout": {
+                "timeout_seconds": 0,
+                "disconnect_while_busy": False,
+            }
+        }))
+        adapter._voice_text_channels[42] = 123
+        adapter._voice_playback_active_guilds.add(42)
+        adapter.leave_voice_channel = AsyncMock()
+        adapter._reset_voice_timeout = MagicMock()
+
+        await adapter._voice_timeout_handler(42)
+
+        adapter.leave_voice_channel.assert_not_awaited()
+        adapter._reset_voice_timeout.assert_called_once_with(42)
+
+    @pytest.mark.asyncio
+    async def test_timeout_during_runner_busy_does_not_leave_and_rearms(self, monkeypatch):
+        _clear_discord_voice_timeout_env(monkeypatch)
+        from gateway.config import PlatformConfig
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = DiscordAdapter(PlatformConfig(extra={
+            "voice_timeout": {
+                "timeout_seconds": 0,
+                "disconnect_while_busy": False,
+            }
+        }))
+        adapter._voice_text_channels[42] = 123
+        adapter._voice_busy_getter = lambda guild_id: guild_id == 42
+        adapter.leave_voice_channel = AsyncMock()
+        adapter._reset_voice_timeout = MagicMock()
+
+        await adapter._voice_timeout_handler(42)
+
+        adapter.leave_voice_channel.assert_not_awaited()
+        adapter._reset_voice_timeout.assert_called_once_with(42)
 
 
 # =====================================================================
@@ -165,6 +292,23 @@ class TestHandleVoiceCommand:
         data = json.loads(runner._VOICE_MODE_PATH.read_text())
         assert data["telegram:123"] == "off"
 
+    def test_voice_timeout_cleanup_does_not_persist_mode_off(self, runner):
+        from gateway.config import Platform
+
+        runner._voice_mode["discord:123"] = "all"
+        runner._save_voice_modes = MagicMock()
+        adapter = SimpleNamespace(
+            _auto_tts_disabled_chats=set(),
+            platform=Platform.DISCORD,
+        )
+        runner.adapters[Platform.DISCORD] = adapter
+
+        runner._handle_voice_timeout_cleanup("123")
+
+        assert runner._voice_mode["discord:123"] == "all"
+        runner._save_voice_modes.assert_not_called()
+        assert adapter._auto_tts_disabled_chats == set()
+
     def test_sync_voice_mode_state_to_adapter_restores_off_chats(self, runner):
         from gateway.config import Platform
         runner._voice_mode = {"telegram:123": "off", "telegram:456": "all"}
@@ -203,6 +347,38 @@ class TestHandleVoiceCommand:
 
         assert adapter._auto_tts_disabled_chats == {"off_chat"}
         assert adapter._auto_tts_enabled_chats == {"on_chat", "tts_chat"}
+
+    def test_sync_suppresses_discord_enabled_chats(self, runner):
+        """Discord VC replies are runner-owned, not base adapter auto-TTS."""
+        from gateway.config import Platform
+        runner._voice_mode = {
+            "discord:on_chat": "voice_only",
+            "discord:tts_chat": "all",
+            "discord:off_chat": "off",
+        }
+        adapter = SimpleNamespace(
+            _auto_tts_default=False,
+            _auto_tts_disabled_chats=set(),
+            _auto_tts_enabled_chats={"stale"},
+            platform=Platform.DISCORD,
+        )
+
+        runner._sync_voice_mode_state_to_adapter(adapter)
+
+        assert adapter._auto_tts_enabled_chats == set()
+        assert adapter._auto_tts_disabled_chats == {"off_chat"}
+
+    def test_set_adapter_auto_tts_enabled_suppresses_discord(self, runner):
+        from gateway.config import Platform
+        adapter = SimpleNamespace(
+            _auto_tts_enabled_chats=set(),
+            _auto_tts_disabled_chats=set(),
+            platform=Platform.DISCORD,
+        )
+
+        runner._set_adapter_auto_tts_enabled(adapter, "123", enabled=True)
+
+        assert adapter._auto_tts_enabled_chats == set()
 
     def test_sync_pushes_config_default_onto_adapter(self, runner, monkeypatch):
         """Issue #16007: ``voice.auto_tts`` must propagate to ``_auto_tts_default``."""
@@ -274,12 +450,11 @@ class TestAutoVoiceReply:
       1. base adapter auto-TTS: fires for voice input in _process_message_background
       2. gateway _send_voice_reply: fires based on voice_mode setting
 
-    To prevent double audio, _send_voice_reply is skipped when voice input
-    already triggered base adapter auto-TTS.
+    To prevent double audio, _send_voice_reply is skipped when non-Discord
+    voice input already triggered base adapter auto-TTS.
 
-    For Discord voice channels, the base adapter now routes play_tts directly
-    into VC playback, so the runner should still skip voice-input follow-ups to
-    avoid double playback.
+    For Discord voice-linked chats, the base adapter generic auto-TTS opt-in is
+    suppressed; GatewayRunner owns VC playback through _send_voice_reply().
     """
 
     @pytest.fixture
@@ -287,15 +462,18 @@ class TestAutoVoiceReply:
         return _make_runner(tmp_path)
 
     def _call(self, runner, voice_mode, message_type, agent_messages=None,
-              response="Hello!", in_voice_channel=False):
+              response="Hello!", in_voice_channel=False, platform_name="telegram"):
         """Call real _should_send_voice_reply on a GatewayRunner instance."""
+        from gateway.config import Platform
+        platform = Platform.DISCORD if platform_name == "discord" else Platform.TELEGRAM
         chat_id = "123"
         if voice_mode != "off":
-            runner._voice_mode["telegram:" + chat_id] = voice_mode
+            runner._voice_mode[f"{platform.value}:" + chat_id] = voice_mode
         else:
-            runner._voice_mode.pop("telegram:" + chat_id, None)
+            runner._voice_mode.pop(f"{platform.value}:" + chat_id, None)
 
         event = _make_event(message_type=message_type)
+        event.source.platform = platform
 
         if in_voice_channel:
             mock_adapter = MagicMock()
@@ -321,7 +499,7 @@ class TestAutoVoiceReply:
     # | Telegram      | text  | off        | skip | skip   | 0 audio      |
     # | Telegram      | text  | voice_only | skip | skip   | 0 audio      |
     # | Telegram      | text  | all        | skip | yes    | 1 audio      |
-    # | Discord text  | voice | all        | yes  | skip*  | 1 audio      |
+    # | Discord text  | voice | all        | skip†| yes    | 1 audio      |
     # | Discord text  | text  | all        | skip | yes    | 1 audio      |
     # | Discord VC    | voice | all        | skip†| yes    | 1 audio (VC) |
     # | Web UI        | voice | off        | yes  | skip   | 1 audio      |
@@ -331,7 +509,7 @@ class TestAutoVoiceReply:
     # | Slack         | text  | all        | skip | yes    | 1 audio      |
     #
     # * skip_double: voice input → base already handles
-    # † Discord play_tts override skips when in VC
+    # † Discord voice-linked chats are not opted into base adapter auto-TTS.
 
     # -- Telegram/Slack/Web: voice input, base handles ---------------------
 
@@ -363,14 +541,23 @@ class TestAutoVoiceReply:
 
     # -- Discord VC exception: runner must handle --------------------------
 
-    def test_discord_vc_voice_input_base_handles(self, runner):
-        """Discord VC + voice input: base adapter play_tts plays in VC,
-        so runner skips to avoid double playback."""
-        assert self._call(runner, "all", MessageType.VOICE, in_voice_channel=True) is False
+    def test_discord_vc_voice_input_runner_fires(self, runner):
+        """Discord VC + voice input: runner handles playback in VC."""
+        assert self._call(
+            runner, "all", MessageType.VOICE, in_voice_channel=True, platform_name="discord"
+        ) is True
 
-    def test_discord_vc_voice_only_base_handles(self, runner):
-        """Discord VC + voice_only + voice: base adapter handles."""
-        assert self._call(runner, "voice_only", MessageType.VOICE, in_voice_channel=True) is False
+    def test_discord_vc_voice_only_runner_fires(self, runner):
+        """Discord VC + voice_only + voice: runner handles playback in VC."""
+        assert self._call(
+            runner, "voice_only", MessageType.VOICE, in_voice_channel=True, platform_name="discord"
+        ) is True
+
+    def test_discord_text_in_all_mode_runner_fires(self, runner):
+        """Discord text input in /voice tts mode still speaks."""
+        assert self._call(
+            runner, "all", MessageType.TEXT, platform_name="discord"
+        ) is True
 
     # -- Edge cases --------------------------------------------------------
 
@@ -458,6 +645,84 @@ class TestSendVoiceReply:
 
         mock_adapter.send_voice.assert_called_once()
         assert mock_tts.call_args.kwargs["output_path"].endswith(".mp3")
+
+    @pytest.mark.asyncio
+    async def test_discord_vc_auto_voice_reply_plays_in_voice_channel(self, runner):
+        from gateway.config import Platform
+
+        mock_adapter = MagicMock()
+        mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
+        mock_adapter.set_voice_busy = MagicMock()
+        mock_adapter.play_in_voice_channel = AsyncMock(return_value=True)
+        mock_adapter.send_voice = AsyncMock()
+        event = _make_event(message_type=MessageType.VOICE)
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        runner.adapters[event.source.platform] = mock_adapter
+
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.mp3"})
+
+        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.unlink"), \
+             patch("os.makedirs"):
+            await runner._send_voice_reply(event, "Hello world")
+
+        mock_adapter.play_in_voice_channel.assert_awaited_once_with(111, "/tmp/test.mp3")
+        assert mock_adapter.set_voice_busy.call_args_list == [
+            call(111, True),
+            call(111, False),
+        ]
+        mock_adapter.send_voice.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_discord_vc_auto_voice_reply_logs_failed_playback(self, runner, caplog):
+        from gateway.config import Platform
+
+        mock_adapter = MagicMock()
+        mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
+        mock_adapter.play_in_voice_channel = AsyncMock(return_value=False)
+        event = _make_event(message_type=MessageType.VOICE)
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+        runner.adapters[event.source.platform] = mock_adapter
+
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.mp3"})
+
+        with caplog.at_level("WARNING"), \
+             patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.unlink"), \
+             patch("os.makedirs"):
+            await runner._send_voice_reply(event, "Hello world")
+
+        assert "Auto voice reply playback failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_auto_voice_reply_logs_send_voice_failure(self, runner, caplog):
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        mock_adapter = AsyncMock()
+        mock_adapter.send_voice = AsyncMock(return_value=SendResult(success=False, error="denied"))
+        event = _make_event()
+        event.source.platform = Platform.SLACK
+        runner.adapters[event.source.platform] = mock_adapter
+
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.mp3"})
+
+        with caplog.at_level("WARNING"), \
+             patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.unlink"), \
+             patch("os.makedirs"):
+            await runner._send_voice_reply(event, "Hello world")
+
+        assert "Auto voice reply send_voice failed" in caplog.text
+        assert "denied" in caplog.text
 
     @pytest.mark.asyncio
     async def test_auto_voice_reply_uses_thread_metadata_helper(self, runner):
@@ -549,6 +814,10 @@ class TestDiscordPlayTtsSkip:
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_timeout_tasks = {}
+        adapter._voice_timeout_disconnect_while_busy = False
+        adapter._voice_playback_active_guilds = set()
+        adapter._voice_reply_busy_guilds = set()
+        adapter._voice_busy_getter = None
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
         adapter._client = None
@@ -1104,6 +1373,10 @@ class TestDiscordVoiceChannelMethods:
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_timeout_tasks = {}
+        adapter._voice_timeout_disconnect_while_busy = False
+        adapter._voice_playback_active_guilds = set()
+        adapter._voice_reply_busy_guilds = set()
+        adapter._voice_busy_getter = None
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
         adapter._voice_input_callback = None
@@ -1912,6 +2185,10 @@ class TestVoiceTimeoutCleansRunnerState:
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_timeout_tasks = {}
+        adapter._voice_timeout_disconnect_while_busy = False
+        adapter._voice_playback_active_guilds = set()
+        adapter._voice_reply_busy_guilds = set()
+        adapter._voice_busy_getter = None
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
         adapter._voice_input_callback = None
@@ -1953,16 +2230,17 @@ class TestVoiceTimeoutCleansRunnerState:
         assert "999" in callback_calls, \
             "_on_voice_disconnect must be called with chat_id on timeout"
 
-    @pytest.mark.asyncio
-    async def test_runner_cleanup_method_removes_voice_mode(self, tmp_path):
-        """_handle_voice_timeout_cleanup removes voice_mode for chat."""
+    def test_runner_cleanup_method_preserves_voice_mode(self, tmp_path):
+        """_handle_voice_timeout_cleanup must not erase chat voice preference."""
         runner = _make_runner(tmp_path)
         runner._voice_mode["discord:999"] = "all"
+        runner._save_voice_modes = MagicMock()
 
         runner._handle_voice_timeout_cleanup("999")
 
-        assert runner._voice_mode["discord:999"] == "off", \
-            "voice_mode must persist explicit off state after timeout cleanup"
+        assert runner._voice_mode["discord:999"] == "all", \
+            "idle timeout must disconnect socket without persisting /voice off"
+        runner._save_voice_modes.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_timeout_without_callback_does_not_crash(self, adapter):
@@ -2046,6 +2324,10 @@ class TestPlaybackTimeout:
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
         adapter._voice_timeout_tasks = {}
+        adapter._voice_timeout_disconnect_while_busy = False
+        adapter._voice_playback_active_guilds = set()
+        adapter._voice_reply_busy_guilds = set()
+        adapter._voice_busy_getter = None
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
         adapter._voice_input_callback = None
@@ -2772,11 +3054,11 @@ class TestVoiceTTSPlayback:
 
     # -- Streaming OFF (existing behavior, must not change) --
 
-    def test_voice_input_runner_skips(self):
-        """Streaming OFF + voice input: runner skips — base adapter handles."""
+    def test_discord_voice_input_runner_handles_vc_playback(self):
+        """Discord voice input: runner owns VC playback instead of base auto-TTS."""
         from gateway.platforms.base import MessageType
         runner = self._make_runner()
-        assert self._call_should_reply(runner, "all", MessageType.VOICE, already_sent=False) is False
+        assert self._call_should_reply(runner, "all", MessageType.VOICE, already_sent=False) is True
 
     def test_text_input_voice_all_runner_fires(self):
         """Streaming OFF + text input + voice_mode=all: runner generates TTS."""
