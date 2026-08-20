@@ -17,7 +17,7 @@ import tempfile
 import html as _html
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, cast
 
 logger = logging.getLogger(__name__)
 
@@ -3481,6 +3481,64 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_clarify failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_voice_clone_panel(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        workspace: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send interactive voice-clone effect controls/audition workspace."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            from tools.voice_clone_effect_panel import button_labels, controls_for_buttons, current_panel, render_panel_text
+            panel_text = render_panel_text()
+            state = cast(Dict[str, int], current_panel()["state"])
+            rows = []
+            if workspace:
+                try:
+                    from tools.voice_clone_workspace import render_workspace_text
+                    panel_text = render_workspace_text(workspace)
+                    state = cast(Dict[str, int], workspace.get("effect_state") or state)
+                    for sample in workspace.get("samples", []):
+                        if sample.get("ok") and sample.get("path"):
+                            await self.send_voice(chat_id, str(sample.get("path")), metadata=metadata)
+                    selected = {int(x) for x in workspace.get("selected_candidates", [])}
+                    rows.append([
+                        InlineKeyboardButton(("✅" if i in selected else "⬜") + f" Sample {i}", callback_data=f"vccand:{i}")
+                        for i in range(1, 5)
+                    ])
+                except Exception:
+                    pass
+            for ctrl in controls_for_buttons():
+                minus_label, plus_label = button_labels(ctrl, state)
+                rows.append([
+                    InlineKeyboardButton(minus_label, callback_data=f"vcfx:{ctrl.key}:-1"),
+                    InlineKeyboardButton(plus_label, callback_data=f"vcfx:{ctrl.key}:1"),
+                ])
+            rows.append([InlineKeyboardButton("Reset safe baseline", callback_data="vcfx:reset:0")])
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=_html.escape(panel_text),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows),
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(),
+            )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_voice_clone_panel failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -3959,6 +4017,104 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Voice-clone effect callbacks (vcfx:control:delta) ---
+        if data.startswith("vccand:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to select voice candidates.")
+                return
+            try:
+                from tools.voice_clone_effect_panel import button_labels, controls_for_buttons
+                from tools.voice_clone_workspace import latest_workspace_for_chat, render_workspace_text, select_candidate
+                idx = int(data.split(":", 1)[1])
+                ws = latest_workspace_for_chat(str(query_chat_id or ""))
+                if not ws:
+                    await query.answer(text="No voice-clone workspace found.")
+                    return
+                ws = select_candidate(str(ws["id"]), idx)
+                selected = {int(x) for x in ws.get("selected_candidates", [])}
+                rows = [[
+                    InlineKeyboardButton(("✅" if i in selected else "⬜") + f" Sample {i}", callback_data=f"vccand:{i}")
+                    for i in range(1, 5)
+                ]]
+                state = cast(Dict[str, int], ws.get("effect_state") or {})
+                for ctrl in controls_for_buttons():
+                    minus_label, plus_label = button_labels(ctrl, state)
+                    rows.append([
+                        InlineKeyboardButton(minus_label, callback_data=f"vcfx:{ctrl.key}:-1"),
+                        InlineKeyboardButton(plus_label, callback_data=f"vcfx:{ctrl.key}:1"),
+                    ])
+                rows.append([InlineKeyboardButton("Reset safe baseline", callback_data="vcfx:reset:0")])
+                await query.answer(text=f"Sample {idx} selection updated")
+                await query.edit_message_text(
+                    text=_html.escape(render_workspace_text(ws)),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(rows),
+                    **self._link_preview_kwargs(),
+                )
+            except Exception as exc:
+                logger.warning("[%s] voice clone candidate callback failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text=f"Could not update candidate: {exc}")
+            return
+
+        if data.startswith("vcfx:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to adjust voice effects.")
+                return
+            try:
+                from tools.voice_clone_effect_panel import (
+                    adjust_control,
+                    button_labels,
+                    controls_for_buttons,
+                    current_panel,
+                    render_panel_text,
+                    reset_panel,
+                )
+                parts = data.split(":", 2)
+                if len(parts) != 3:
+                    await query.answer(text="Invalid effect control.")
+                    return
+                control, delta_s = parts[1], parts[2]
+                if control == "reset":
+                    reset_panel()
+                    answer = "Reset voice effects"
+                else:
+                    result = adjust_control(control, int(delta_s))
+                    answer = f"{control}: {result['before']} → {result['after']}"
+                rows = []
+                state = cast(Dict[str, int], current_panel()["state"])
+                for ctrl in controls_for_buttons():
+                    minus_label, plus_label = button_labels(ctrl, state)
+                    rows.append([
+                        InlineKeyboardButton(minus_label, callback_data=f"vcfx:{ctrl.key}:-1"),
+                        InlineKeyboardButton(plus_label, callback_data=f"vcfx:{ctrl.key}:1"),
+                    ])
+                rows.append([InlineKeyboardButton("Reset safe baseline", callback_data="vcfx:reset:0")])
+                await query.answer(text=answer)
+                await query.edit_message_text(
+                    text=_html.escape(render_panel_text()),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(rows),
+                    **self._link_preview_kwargs(),
+                )
+            except Exception as exc:
+                logger.warning("[%s] voice clone effect callback failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text=f"Could not update effect: {exc}")
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mc:", "mb", "mx", "mg:")):

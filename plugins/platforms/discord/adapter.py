@@ -238,6 +238,16 @@ def _metadata_marks_nonconversational(metadata: Optional[Dict[str, Any]]) -> boo
     return any(bool(metadata.get(key)) for key in _DISCORD_NONCONVERSATIONAL_METADATA_KEYS)
 
 
+def _user_mention_from_metadata(metadata: Optional[Dict[str, Any]]) -> str:
+    """Return a safe Discord user mention for prompt metadata, if available."""
+    if not isinstance(metadata, dict):
+        return ""
+    user_id = str(metadata.get("user_id") or "").strip()
+    if user_id.isdigit():
+        return f"<@{user_id}>"
+    return ""
+
+
 def _looks_like_nonconversational_history_message(content: str) -> bool:
     """Fallback recognizer for legacy status bumps missing persisted IDs."""
     text = content or ""
@@ -763,12 +773,20 @@ class DiscordAdapter(BasePlatformAdapter):
         # the bot in the channel when the user deliberately picked text-only
         # (/voice off) instead of leaving (/voice leave).
         self._voice_mode_getter: Optional[Callable] = None  # set by run.py
+        # Returns True while the linked Hermes agent task is still running;
+        # set by run.py. Lets the inactivity timer avoid disconnecting in the
+        # middle of long voice-originated/tool-heavy turns when configured.
+        self._voice_busy_getter: Optional[Callable] = None  # set by run.py
         # Phase 3: continuous voice mixer (ambient idle bed + ducked speech).
-        # Installed once per guild on join; lets acks / TTS / the "thinking"
-        # loop overlap in one outgoing stream instead of stop-and-swap.
+        # Installed once per guild on join; lets acks / TTS / busy audio / the
+        # "thinking" loop overlap in one outgoing stream instead of stop-and-swap.
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
+        self._busy_pcm_cache: Optional[bytes] = None  # decoded task-busy bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
+        self._voice_timeout_cfg: Dict[str, Any] = self._load_voice_timeout_config()
+        self._voice_busy_cfg: Dict[str, Any] = self._load_voice_busy_config()
+        self.VOICE_TIMEOUT = int(self._voice_timeout_cfg.get("timeout_seconds", self.VOICE_TIMEOUT) or 0)
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
@@ -2114,7 +2132,19 @@ class DiscordAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send audio as a Discord file attachment."""
+        """Send audio, preferring live VC playback for bound voice chats."""
+        for gid, text_ch_id in self._voice_text_channels.items():
+            if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
+                logger.info("[%s] Playing voice/audio delivery in linked voice channel (guild=%d)", self.name, gid)
+                success = await self.play_in_voice_channel(gid, audio_path)
+                if success:
+                    return SendResult(success=True)
+                logger.warning(
+                    "[%s] Voice-channel playback failed for guild=%d; falling back to text audio delivery",
+                    self.name,
+                    gid,
+                )
+                break
         try:
             import io
 
@@ -2233,6 +2263,56 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord.voice_fx config: %s", e)
         return defaults
 
+    def _load_voice_timeout_config(self) -> Dict[str, Any]:
+        """Read Discord VC inactivity settings from config.yaml."""
+        defaults: Dict[str, Any] = {
+            "timeout_seconds": 300,
+            "disconnect_while_busy": True,
+        }
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            timeout_cfg = ((cfg.get("discord") or {}).get("voice_timeout") or {})
+            if isinstance(timeout_cfg, dict):
+                for k, v in timeout_cfg.items():
+                    if k in defaults and v is not None:
+                        defaults[k] = v
+        except Exception as e:
+            logger.debug("Could not load discord.voice_timeout config: %s", e)
+        try:
+            defaults["timeout_seconds"] = max(0, int(defaults.get("timeout_seconds") or 0))
+        except (TypeError, ValueError):
+            defaults["timeout_seconds"] = 300
+        defaults["disconnect_while_busy"] = bool(defaults.get("disconnect_while_busy", True))
+        return defaults
+
+    def _load_voice_busy_config(self) -> Dict[str, Any]:
+        """Read Discord VC busy-audio settings from config.yaml."""
+        defaults: Dict[str, Any] = {
+            "enabled": False,
+            "path": "",
+            "gain": 0.18,
+            "duck_gain": 0.06,
+        }
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            busy_cfg = ((cfg.get("discord") or {}).get("voice_busy") or {})
+            if isinstance(busy_cfg, dict):
+                for k, v in busy_cfg.items():
+                    if k in defaults and v is not None:
+                        defaults[k] = v
+        except Exception as e:
+            logger.debug("Could not load discord.voice_busy config: %s", e)
+        defaults["enabled"] = bool(defaults.get("enabled", False))
+        defaults["path"] = str(defaults.get("path") or "").strip()
+        for key, fallback in (("gain", 0.18), ("duck_gain", 0.06)):
+            try:
+                defaults[key] = max(0.0, min(1.0, float(defaults.get(key, fallback))))
+            except (TypeError, ValueError):
+                defaults[key] = fallback
+        return defaults
+
     def _get_ambient_pcm(self) -> Optional[bytes]:
         """Return decoded 48k/stereo/s16le PCM for the ambient idle bed.
 
@@ -2259,6 +2339,63 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ambient_pcm_cache = pcm
         return pcm
 
+    def _get_busy_pcm(self) -> Optional[bytes]:
+        """Return decoded PCM for the configured task-busy audio bed."""
+        if self._busy_pcm_cache is not None:
+            return self._busy_pcm_cache
+        if not self._voice_busy_cfg.get("enabled"):
+            return None
+        path = str(self._voice_busy_cfg.get("path") or "").strip()
+        if not path:
+            return None
+        path = os.path.expanduser(os.path.expandvars(path))
+        if not os.path.isfile(path):
+            logger.warning("Discord voice_busy.path does not exist: %s", path)
+            return None
+        try:
+            from voice_mixer import decode_to_pcm
+        except ImportError:
+            from .voice_mixer import decode_to_pcm
+        pcm = decode_to_pcm(path)
+        if not pcm:
+            logger.warning("Discord voice_busy.path failed to decode: %s", path)
+            return None
+        self._busy_pcm_cache = pcm
+        return pcm
+
+    def _restore_idle_ambient(self, guild_id: int) -> None:
+        """Restore the normal voice_fx ambient bed, or silence if disabled."""
+        mixer = self._voice_mixers.get(guild_id)
+        if mixer is None:
+            return
+        if self._voice_fx_cfg.get("enabled") and self._voice_fx_cfg.get("ambient_enabled"):
+            ambient = self._get_ambient_pcm()
+            mixer.set_ambient(ambient, gain=float(self._voice_fx_cfg.get("ambient_gain", 0.18)))
+        else:
+            mixer.set_ambient(None)
+
+    async def start_busy_audio(self, guild_id: int) -> bool:
+        """Start looping configured busy audio in the VC mixer, if available."""
+        if not self._voice_busy_cfg.get("enabled"):
+            return False
+        mixer = self._voice_mixers.get(guild_id)
+        if mixer is None:
+            return False
+        pcm = await asyncio.to_thread(self._get_busy_pcm)
+        if not pcm:
+            return False
+        mixer.set_ambient(pcm, gain=float(self._voice_busy_cfg.get("gain", 0.18)))
+        self._reset_voice_timeout(guild_id)
+        return True
+
+    async def stop_busy_audio(self, guild_id: int) -> None:
+        """Stop busy audio and restore the normal idle ambient state."""
+        mixer = self._voice_mixers.get(guild_id)
+        if mixer is None:
+            return
+        await asyncio.to_thread(self._restore_idle_ambient, guild_id)
+        self._reset_voice_timeout(guild_id)
+
     async def _install_voice_mixer(self, guild_id: int, vc) -> None:
         """Create a VoiceMixer, start the ambient bed, and play it on the VC.
 
@@ -2272,12 +2409,16 @@ class DiscordAdapter(BasePlatformAdapter):
 
         mixer = VoiceMixer(
             ambient_gain=float(self._voice_fx_cfg.get("ambient_gain", 0.18)),
-            duck_gain=float(self._voice_fx_cfg.get("duck_gain", 0.06)),
+            duck_gain=float(
+                self._voice_busy_cfg.get("duck_gain", self._voice_fx_cfg.get("duck_gain", 0.06))
+            ),
             speech_gain=float(self._voice_fx_cfg.get("speech_gain", 1.0)),
         )
-        ambient = await asyncio.to_thread(self._get_ambient_pcm)
-        if ambient:
-            mixer.set_ambient(ambient)
+        ambient = None
+        if self._voice_fx_cfg.get("enabled") and self._voice_fx_cfg.get("ambient_enabled"):
+            ambient = await asyncio.to_thread(self._get_ambient_pcm)
+            if ambient:
+                mixer.set_ambient(ambient)
 
         def _after(error):
             if error:
@@ -2385,7 +2526,10 @@ class DiscordAdapter(BasePlatformAdapter):
             # Phase 3: install the continuous mixer (ambient bed + ducked
             # speech).  Best-effort — if it fails we fall back to the legacy
             # one-shot FFmpegPCMAudio playback path in play_in_voice_channel.
-            if getattr(self, "_voice_fx_cfg", {}).get("enabled"):
+            if (
+                getattr(self, "_voice_fx_cfg", {}).get("enabled")
+                or getattr(self, "_voice_busy_cfg", {}).get("enabled")
+            ):
                 try:
                     await self._install_voice_mixer(guild_id, vc)
                 except Exception as e:
@@ -2422,8 +2566,11 @@ class DiscordAdapter(BasePlatformAdapter):
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
 
-    # Maximum seconds to wait for voice playback before giving up
-    PLAYBACK_TIMEOUT = 120
+    # Maximum seconds to wait for voice playback before giving up. Keep this
+    # high enough for long spoken answers; shorter notice-specific failures are
+    # handled by non-blocking scheduling at the gateway layer instead of cutting
+    # off active Discord playback.
+    PLAYBACK_TIMEOUT = 900
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play an audio file in the connected voice channel.
@@ -2517,6 +2664,8 @@ class DiscordAdapter(BasePlatformAdapter):
         task = self._voice_timeout_tasks.pop(guild_id, None)
         if task:
             task.cancel()
+        if self.VOICE_TIMEOUT <= 0:
+            return
         self._voice_timeout_tasks[guild_id] = asyncio.ensure_future(
             self._voice_timeout_handler(guild_id)
         )
@@ -2542,6 +2691,20 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
             except Exception:
                 pass
+        voice_timeout_cfg = getattr(self, "_voice_timeout_cfg", {"disconnect_while_busy": True})
+        if not voice_timeout_cfg.get("disconnect_while_busy", True):
+            _busy_getter = getattr(self, "_voice_busy_getter", None)
+            if _busy_getter is not None:
+                try:
+                    if _busy_getter(guild_id):
+                        logger.info(
+                            "Voice timeout deferred: guild_id=%s has active Hermes task",
+                            guild_id,
+                        )
+                        self._reset_voice_timeout(guild_id)
+                        return
+                except Exception:
+                    pass
         await self.leave_voice_channel(guild_id)
         # Notify the runner so it can clean up voice_mode state
         if self._on_voice_disconnect and text_ch_id:
@@ -2687,6 +2850,34 @@ class DiscordAdapter(BasePlatformAdapter):
         """Convert PCM -> WAV -> STT -> callback."""
         from tools.voice_mode import is_whisper_hallucination
 
+        def _looks_like_low_confidence_noise(result: dict, transcript: str) -> bool:
+            """Filter Discord VC background-noise transcripts before dispatch.
+
+            Local Whisper sometimes auto-detects an unrelated non-English
+            language with low confidence and emits Georgian/Arabic/CJK-looking
+            text from fan noise, room audio, or brief non-speech.  Text message
+            STT can preserve multilingual output; this guard is intentionally
+            scoped to live Discord VC where accidental background capture is
+            common and false command dispatch is worse than dropping noise.
+            """
+            lang = str(result.get("language") or "").lower()
+            try:
+                prob = float(result.get("language_probability") or 0.0)
+            except (TypeError, ValueError):
+                prob = 0.0
+            if not transcript:
+                return True
+            chars = [ch for ch in transcript if not ch.isspace()]
+            if not chars:
+                return True
+            non_latin = sum(1 for ch in chars if ord(ch) > 0x024F)
+            non_latin_ratio = non_latin / max(len(chars), 1)
+            if (not lang or lang not in {"en", "eng"}) and prob < 0.60 and non_latin_ratio > 0.20:
+                return True
+            if transcript.count("�") >= 1 and prob < 0.70:
+                return True
+            return False
+
         tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
         wav_path = tmp_f.name
         tmp_f.close()
@@ -2699,7 +2890,18 @@ class DiscordAdapter(BasePlatformAdapter):
             if not result.get("success"):
                 return
             transcript = result.get("transcript", "").strip()
-            if not transcript or is_whisper_hallucination(transcript):
+            if (
+                not transcript
+                or is_whisper_hallucination(transcript)
+                or _looks_like_low_confidence_noise(result, transcript)
+            ):
+                logger.info(
+                    "Filtered Discord VC transcript from user %d: lang=%s prob=%s text=%r",
+                    user_id,
+                    result.get("language"),
+                    result.get("language_probability"),
+                    transcript[:100],
+                )
                 return
 
             logger.info("Voice input from user %d: %s", user_id, transcript[:100])
@@ -4717,7 +4919,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 allowed_role_ids=self._allowed_role_ids,
             )
 
-            msg = await channel.send(embed=embed, view=view)
+            mention = _user_mention_from_metadata(metadata)
+            msg = await channel.send(content=mention or None, embed=embed, view=view)
             view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
 
@@ -4871,7 +5074,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 view = None
 
-            msg = await channel.send(embed=embed, view=view) if view else await channel.send(embed=embed)
+            mention = _user_mention_from_metadata(metadata)
+            if view:
+                msg = await channel.send(content=mention or None, embed=embed, view=view)
+            else:
+                msg = await channel.send(content=mention or None, embed=embed)
             if view:
                 view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
@@ -4976,6 +5183,58 @@ class DiscordAdapter(BasePlatformAdapter):
 
         except Exception as e:
             logger.warning("[%s] send_model_picker failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+    async def send_voice_clone_panel(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        workspace: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send interactive voice-clone effect controls/audition workspace."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        try:
+            from tools.voice_clone_effect_panel import render_panel_text
+
+            target_id = str(metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id)
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+
+            if workspace:
+                try:
+                    from tools.voice_clone_workspace import render_workspace_text
+                    sample_paths = [
+                        s.get("path") for s in workspace.get("samples", [])
+                        if s.get("ok") and s.get("path") and os.path.isfile(str(s.get("path")))
+                    ]
+                    if sample_paths:
+                        await channel.send(
+                            "Generated four voice-clone audition samples:",
+                            files=[discord.File(str(p)) for p in sample_paths[:4]],
+                        )
+                    panel_text = render_workspace_text(workspace)
+                except Exception:
+                    panel_text = render_panel_text()
+            else:
+                panel_text = render_panel_text()
+
+            embed = discord.Embed(
+                title="🎛 Voice Clone Audition" if workspace else "🎛 Voice Clone Effects",
+                description=panel_text[:4096],
+                color=discord.Color.blurple(),
+            )
+            view = VoiceCloneEffectsView(
+                allowed_user_ids=self._allowed_user_ids,
+                allowed_role_ids=self._allowed_role_ids,
+                workspace_id=workspace.get("id") if workspace else None,
+            )
+            msg = await channel.send(embed=embed, view=view)
+            view._message = msg
+            return SendResult(success=True, message_id=str(msg.id))
+        except Exception as e:
+            logger.warning("[%s] send_voice_clone_panel failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
     def _get_parent_channel_id(self, channel: Any) -> Optional[str]:
@@ -5735,7 +5994,7 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, VoiceCloneEffectsView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -6058,6 +6317,153 @@ def _define_discord_view_classes() -> None:
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
+
+    class VoiceCloneEffectsView(discord.ui.View):
+        """Interactive controls for the active local voice-clone effect preset."""
+
+        def __init__(self, allowed_user_ids: set, allowed_role_ids: Optional[set] = None, workspace_id: Optional[str] = None):
+            super().__init__(timeout=None)
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+            self.workspace_id = workspace_id
+            self._rebuild_buttons()
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            return _component_check_auth(interaction, self.allowed_user_ids, self.allowed_role_ids)
+
+        def _rebuild_buttons(self) -> None:
+            self.clear_items()
+            if self.workspace_id:
+                try:
+                    from tools.voice_clone_workspace import load_workspace
+                    ws = load_workspace(self.workspace_id)
+                    selected = {int(x) for x in ws.get("selected_candidates", [])}
+                    for idx in range(1, 5):
+                        btn = discord.ui.Button(
+                            label=("✅" if idx in selected else "⬜") + f" Sample {idx}",
+                            style=discord.ButtonStyle.success if idx in selected else discord.ButtonStyle.secondary,
+                            custom_id=f"vccand:{self.workspace_id}:{idx}",
+                            row=0,
+                        )
+                        btn.callback = self._make_candidate_callback(idx)
+                        self.add_item(btn)
+                except Exception:
+                    pass
+            try:
+                from tools.voice_clone_effect_panel import button_labels, current_panel, controls_for_buttons
+                if self.workspace_id:
+                    from tools.voice_clone_workspace import load_workspace
+                    state = (load_workspace(self.workspace_id).get("effect_state") or current_panel()["state"])
+                else:
+                    state = current_panel()["state"]
+                controls = list(controls_for_buttons())
+            except Exception:
+                state = {}
+                controls = []
+                button_labels = lambda ctrl, state=None: (f"− {ctrl.label} {ctrl.default}/10", f"+ {ctrl.label} {ctrl.default}/10")
+            for idx, ctrl in enumerate(controls):
+                row = min(4, (idx // 2) + (1 if self.workspace_id else 0))
+                labels_state = state if isinstance(state, dict) else {ctrl.key: ctrl.default}
+                minus_label, plus_label = button_labels(ctrl, labels_state)
+                minus = discord.ui.Button(
+                    label=minus_label,
+                    style=discord.ButtonStyle.secondary,
+                    custom_id=f"vcfx:{ctrl.key}:-1",
+                    row=row,
+                )
+                plus = discord.ui.Button(
+                    label=plus_label,
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"vcfx:{ctrl.key}:1",
+                    row=row,
+                )
+                minus.callback = self._make_callback(ctrl.key, -1)
+                plus.callback = self._make_callback(ctrl.key, 1)
+                self.add_item(minus)
+                self.add_item(plus)
+            reset = discord.ui.Button(
+                label="Reset safe baseline",
+                style=discord.ButtonStyle.danger,
+                custom_id="vcfx:reset:0",
+                row=4,
+            )
+            reset.callback = self._reset_callback
+            self.add_item(reset)
+
+        def _make_callback(self, control: str, delta: int):
+            async def _callback(interaction: discord.Interaction):
+                await self._adjust(interaction, control, delta)
+            return _callback
+
+        def _make_candidate_callback(self, index: int):
+            async def _callback(interaction: discord.Interaction):
+                await self._toggle_candidate(interaction, index)
+            return _callback
+
+        async def _toggle_candidate(self, interaction: discord.Interaction, index: int) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized to select voice candidates~", ephemeral=True)
+                return
+            try:
+                from tools.voice_clone_workspace import render_workspace_text, select_candidate
+                ws = select_candidate(str(self.workspace_id), index)
+                self._rebuild_buttons()
+                embed = discord.Embed(
+                    title="🎛 Voice Clone Audition",
+                    description=render_workspace_text(ws)[:4096],
+                    color=discord.Color.blurple(),
+                )
+                embed.set_footer(text=f"Updated candidate selection by {interaction.user.display_name}")
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception as exc:
+                logger.warning("Discord voice clone candidate toggle failed: %s", exc, exc_info=True)
+                await interaction.response.send_message(f"Could not update candidate: {exc}", ephemeral=True)
+
+        async def _adjust(self, interaction: discord.Interaction, control: str, delta: int) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized to adjust voice effects~", ephemeral=True)
+                return
+            try:
+                if self.workspace_id:
+                    from tools.voice_clone_workspace import apply_effect_delta, render_workspace_text
+                    result = apply_effect_delta(str(self.workspace_id), control, delta)
+                    panel_text = render_workspace_text(result["workspace"])
+                    title = "🎛 Voice Clone Audition"
+                else:
+                    from tools.voice_clone_effect_panel import adjust_control, render_panel_text
+                    result = adjust_control(control, delta)
+                    panel_text = render_panel_text()
+                    title = "🎛 Voice Clone Effects"
+                self._rebuild_buttons()
+                embed = discord.Embed(
+                    title=title,
+                    description=panel_text[:4096],
+                    color=discord.Color.blurple(),
+                )
+                embed.set_footer(text=f"Updated {control}: {result['before']} → {result['after']} by {interaction.user.display_name}")
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception as exc:
+                logger.warning("Discord voice clone effect adjust failed: %s", exc, exc_info=True)
+                await interaction.response.send_message(f"Could not update effect: {exc}", ephemeral=True)
+
+        async def _reset_callback(self, interaction: discord.Interaction) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized to adjust voice effects~", ephemeral=True)
+                return
+            try:
+                from tools.voice_clone_effect_panel import reset_panel, render_panel_text
+                reset_panel()
+                self._rebuild_buttons()
+                embed = discord.Embed(
+                    title="🎛 Voice Clone Effects",
+                    description=render_panel_text()[:4096],
+                    color=discord.Color.blurple(),
+                )
+                embed.set_footer(text=f"Reset by {interaction.user.display_name}")
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception as exc:
+                logger.warning("Discord voice clone effect reset failed: %s", exc, exc_info=True)
+                await interaction.response.send_message(f"Could not reset effects: {exc}", ephemeral=True)
 
     class ModelPickerView(discord.ui.View):
         """Interactive select-menu view for model switching.

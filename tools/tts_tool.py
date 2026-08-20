@@ -176,6 +176,9 @@ DEFAULT_KITTENTTS_VOICE = "Jasper"
 DEFAULT_PIPER_VOICE = "en_US-lessac-medium"  # balanced size/quality
 DEFAULT_OPENAI_VOICE = "alloy"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_LOCAL_HTTP_BASE_URL = "http://127.0.0.1:8020/v1"
+DEFAULT_LOCAL_HTTP_MODEL = "local-tts"
+DEFAULT_LOCAL_HTTP_VOICE = "default"
 DEFAULT_MINIMAX_MODEL = "speech-02-hd"
 DEFAULT_MINIMAX_VOICE_ID = "English_expressive_narrator"
 DEFAULT_MINIMAX_BASE_URL = "https://api.minimax.io/v1/t2a_v2"
@@ -228,6 +231,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
     "piper": 5000,        # local VITS model, phoneme-based; practical cap
+    "local_http": 5000,   # local sidecar; conservative default, user-overridable
 }
 
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
@@ -391,6 +395,7 @@ BUILTIN_TTS_PROVIDERS = frozenset({
     "neutts",
     "kittentts",
     "piper",
+    "local_http",
 })
 
 DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS = 120
@@ -1276,6 +1281,84 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
 
 
 # ===========================================================================
+# Provider: Local HTTP (OpenAI-compatible /v1/audio/speech sidecar)
+# ===========================================================================
+def _tts_response_format_from_path(output_path: str) -> str:
+    """Return an OpenAI-style response_format inferred from an output path."""
+    suffix = Path(output_path).suffix.lower().lstrip(".")
+    if suffix == "ogg":
+        return "opus"
+    if suffix in {"mp3", "wav", "flac"}:
+        return suffix
+    return "mp3"
+
+
+def _generate_local_http_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech via a local/LAN OpenAI-compatible HTTP TTS sidecar."""
+    import requests
+
+    local_config = tts_config.get("local_http", {}) if isinstance(tts_config, dict) else {}
+    if not isinstance(local_config, dict):
+        local_config = {}
+
+    endpoint = str(local_config.get("endpoint") or "").strip()
+    if endpoint:
+        if endpoint.startswith(("http://", "https://")):
+            url = endpoint
+        else:
+            base = str(local_config.get("base_url") or DEFAULT_LOCAL_HTTP_BASE_URL).strip().rstrip("/")
+            url = f"{base}/{endpoint.lstrip('/')}"
+    else:
+        base = str(local_config.get("base_url") or DEFAULT_LOCAL_HTTP_BASE_URL).strip().rstrip("/")
+        url = f"{base}/audio/speech"
+
+    response_format = str(
+        local_config.get("response_format") or _tts_response_format_from_path(output_path)
+    ).strip().lower().lstrip(".")
+    if response_format == "ogg":
+        response_format = "opus"
+    if response_format not in {"mp3", "opus", "wav", "flac"}:
+        response_format = _tts_response_format_from_path(output_path)
+
+    payload: Dict[str, Any] = {
+        "model": str(local_config.get("model") or DEFAULT_LOCAL_HTTP_MODEL),
+        "input": text,
+        "voice": str(local_config.get("voice") or DEFAULT_LOCAL_HTTP_VOICE),
+        "response_format": response_format,
+    }
+    extra_body = local_config.get("extra_body")
+    if isinstance(extra_body, dict):
+        payload.update(extra_body)
+
+    headers = {"Accept": "audio/*", "Content-Type": "application/json"}
+    api_key = str(
+        local_config.get("api_key") or get_env_value("LOCAL_TTS_API_KEY") or ""
+    ).strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        timeout = float(local_config.get("timeout", 60) or 60)
+    except (TypeError, ValueError):
+        timeout = 60.0
+    if timeout <= 0:
+        timeout = 60.0
+
+    response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    if response.status_code >= 400:
+        raise RuntimeError(f"local_http TTS request failed with HTTP {response.status_code}")
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    if "application/json" in content_type:
+        raise RuntimeError("local_http TTS returned JSON instead of audio")
+    if not response.content:
+        raise RuntimeError("local_http TTS returned no audio bytes")
+
+    with open(output_path, "wb") as fh:
+        fh.write(response.content)
+    return output_path
+
+
+# ===========================================================================
 # Provider: MiniMax TTS
 # ===========================================================================
 def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
@@ -2125,6 +2208,13 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
     return output_path
 
 
+def _sanitize_text_for_tts(text: str) -> str:
+    """Apply Hermes' default speech-safety policy before provider synthesis."""
+    from tools.voice_interactions import sanitize_for_speech
+
+    return sanitize_for_speech(text)
+
+
 # ===========================================================================
 # Main tool function
 # ===========================================================================
@@ -2151,6 +2241,9 @@ def text_to_speech_tool(
     """
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
+    text = _sanitize_text_for_tts(text)
+    if not text:
+        return tool_error("Text is empty after TTS sanitization", success=False)
 
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
@@ -2216,7 +2309,7 @@ def text_to_speech_tool(
             file_path = out_dir / f"tts_{timestamp}.{fmt}"
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
+        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini", "local_http"}:
             file_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
@@ -2271,6 +2364,10 @@ def text_to_speech_tool(
                 }, ensure_ascii=False)
             logger.info("Generating speech with OpenAI TTS...")
             _generate_openai_tts(text, file_str, tts_config)
+
+        elif provider == "local_http":
+            logger.info("Generating speech with local HTTP TTS...")
+            _generate_local_http_tts(text, file_str, tts_config)
 
         elif provider == "minimax":
             logger.info("Generating speech with MiniMax TTS...")
@@ -2404,7 +2501,7 @@ def text_to_speech_tool(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
+        elif provider in {"elevenlabs", "openai", "mistral", "gemini", "local_http"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")
 
         file_size = os.path.getsize(file_str)

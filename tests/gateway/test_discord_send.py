@@ -46,6 +46,52 @@ from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
 @pytest.mark.asyncio
+async def test_exec_approval_mentions_requesting_discord_user():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent_msg = SimpleNamespace(id=42)
+    channel = SimpleNamespace(send=AsyncMock(return_value=sent_msg))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send_exec_approval(
+        "555",
+        "rm -rf /tmp/example",
+        "session-key",
+        metadata={"user_id": "123456789"},
+    )
+
+    assert result.success is True
+    channel.send.assert_awaited_once()
+    assert channel.send.await_args.kwargs["content"] == "<@123456789>"
+
+
+@pytest.mark.asyncio
+async def test_clarify_mentions_requesting_discord_user():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent_msg = SimpleNamespace(id=43)
+    channel = SimpleNamespace(send=AsyncMock(return_value=sent_msg))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send_clarify(
+        "555",
+        "Approve this?",
+        ["Yes", "No"],
+        "clarify-id",
+        "session-key",
+        metadata={"user_id": "123456789"},
+    )
+
+    assert result.success is True
+    channel.send.assert_awaited_once()
+    assert channel.send.await_args.kwargs["content"] == "<@123456789>"
+
+
+@pytest.mark.asyncio
 async def test_send_retries_without_reference_when_reply_target_is_system_message():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
 
@@ -81,6 +127,39 @@ async def test_send_retries_without_reference_when_reply_target_is_system_messag
     ref_msg.to_reference.assert_called_once_with(fail_if_not_exists=False)
     assert send_calls[0]["reference"] is reference_obj
     assert send_calls[1]["reference"] is None
+
+
+@pytest.mark.asyncio
+async def test_voice_timeout_defers_when_busy_and_configured_not_to_disconnect():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter.VOICE_TIMEOUT = 0
+    adapter._voice_timeout_cfg = {"timeout_seconds": 0, "disconnect_while_busy": False}
+    adapter._voice_text_channels[123] = 456
+    adapter._voice_mode_getter = lambda chat_id: "all"
+    adapter._voice_busy_getter = lambda guild_id: True
+    adapter.leave_voice_channel = AsyncMock()
+
+    await adapter._voice_timeout_handler(123)
+
+    adapter.leave_voice_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_busy_audio_sets_and_clears_mixer_ambient(monkeypatch):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._voice_busy_cfg = {"enabled": True, "path": "/tmp/busy.wav", "gain": 0.25, "duck_gain": 0.05}
+    adapter._voice_fx_cfg = {"enabled": False, "ambient_enabled": False, "ambient_gain": 0.18}
+    monkeypatch.setattr(adapter, "_get_busy_pcm", lambda: b"pcm")
+    adapter._reset_voice_timeout = MagicMock()
+
+    mixer = SimpleNamespace(set_ambient=MagicMock())
+    adapter._voice_mixers[123] = mixer
+
+    assert await adapter.start_busy_audio(123) is True
+    mixer.set_ambient.assert_called_with(b"pcm", gain=0.25)
+
+    await adapter.stop_busy_audio(123)
+    mixer.set_ambient.assert_called_with(None)
 
 
 @pytest.mark.asyncio
