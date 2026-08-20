@@ -538,7 +538,7 @@ DEFAULT_CONFIG = {
     
     # Text-to-speech configuration
     "tts": {
-        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "minimax" | "mistral" | "neutts" (local)
+        "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "minimax" | "mistral" | "neutts" (local) | "local_http" (OpenAI-compatible local server)
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
@@ -561,6 +561,16 @@ DEFAULT_CONFIG = {
             "ref_text": "",   # Path to reference voice transcript (empty = bundled default)
             "model": "neuphonic/neutts-air-q4-gguf",  # HuggingFace model repo
             "device": "cpu",  # cpu, cuda, or mps
+        },
+        "local_http": {
+            "base_url": "http://127.0.0.1:8020/v1",  # OpenAI-compatible local TTS server
+            "endpoint": "",  # Optional full URL override; default is <base_url>/audio/speech
+            "model": "local-tts",
+            "voice": "default",
+            "timeout": 60,
+            "api_key": "",  # Optional bearer token; LOCAL_TTS_API_KEY env var also supported
+            "response_format": "",  # Optional override: mp3, opus, wav, flac
+            "extra_body": {},  # Engine-specific fields, e.g. {"language": "en"}
         },
     },
     

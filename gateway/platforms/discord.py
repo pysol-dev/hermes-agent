@@ -1875,7 +1875,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Register skills under a single /skill command group with category
         # subcommand groups.  This uses 1 top-level slot instead of N,
         # supporting up to 25 categories × 25 skills = 625 skills.
-        self._register_skill_group(tree)
+        # Discord also enforces an aggregate 8000-byte command payload limit;
+        # large local skill catalogs can exceed it, so allow operators to
+        # disable this optional command group while keeping core commands live.
+        if os.getenv("DISCORD_REGISTER_SKILL_COMMANDS", "true").lower() not in {"0", "false", "no", "off"}:
+            self._register_skill_group(tree)
 
     def _register_skill_group(self, tree) -> None:
         """Register a ``/skill`` command group with category subcommand groups.

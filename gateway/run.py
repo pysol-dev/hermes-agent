@@ -658,7 +658,8 @@ class GatewayRunner:
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
 
         # Track background tasks to prevent garbage collection mid-execution
-        self._background_tasks: set = set()
+        self._background_tasks: set[asyncio.Task] = set()
+        self._voice_tts_warm_task: Optional[asyncio.Task] = None
 
 
 
@@ -676,6 +677,7 @@ class GatewayRunner:
     # -- Voice mode persistence ------------------------------------------
 
     _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
+    _VOICE_ACTIVE_PATH = _hermes_home / "gateway_active_voice.json"
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
@@ -712,15 +714,110 @@ class GatewayRunner:
         else:
             disabled_chats.discard(chat_id)
 
+    def _set_adapter_auto_tts_for_voice_mode(self, adapter, chat_id: str, mode: str) -> None:
+        """Keep base-adapter voice-input auto-TTS off while runner voice mode is on.
+
+        The runner has a more reliable Discord path: it generates TTS once and
+        plays the audio directly in the connected voice channel.  The base
+        adapter's generic MessageType.VOICE auto-TTS path can race with this or
+        fall back to uploading voice-message attachments, which produced silent
+        1-second clips during live Discord voice chats.
+        """
+        self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=(mode != "off"))
+
     def _sync_voice_mode_state_to_adapter(self, adapter) -> None:
-        """Restore persisted /voice off state into a live platform adapter."""
+        """Restore persisted voice-mode state into a live platform adapter."""
         disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
         if not isinstance(disabled_chats, set):
             return
         disabled_chats.clear()
         disabled_chats.update(
-            chat_id for chat_id, mode in self._voice_mode.items() if mode == "off"
+            chat_id for chat_id, mode in self._voice_mode.items() if mode != "off"
         )
+
+    def _load_active_voice_channels(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            data = json.loads(self._VOICE_ACTIVE_PATH.read_text())
+            if isinstance(data, dict):
+                return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        except Exception:
+            pass
+        return {}
+
+    def _save_active_voice_channels(self, data: Dict[str, Dict[str, Any]]) -> None:
+        try:
+            self._VOICE_ACTIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._VOICE_ACTIVE_PATH.write_text(json.dumps(data, indent=2))
+        except OSError as e:
+            logger.warning("Failed to save active voice channels: %s", e)
+
+    def _remember_active_voice_channel(
+        self,
+        *,
+        guild_id: int,
+        voice_channel_id: int,
+        text_channel_id: str,
+        source: SessionSource,
+    ) -> None:
+        data = self._load_active_voice_channels()
+        data[str(guild_id)] = {
+            "guild_id": int(guild_id),
+            "voice_channel_id": int(voice_channel_id),
+            "text_channel_id": str(text_channel_id),
+            "source": source.to_dict(),
+        }
+        self._save_active_voice_channels(data)
+
+    def _forget_active_voice_channel(self, guild_id: int) -> None:
+        data = self._load_active_voice_channels()
+        if data.pop(str(guild_id), None) is not None:
+            self._save_active_voice_channels(data)
+
+    async def _restore_active_voice_channels(self, adapter) -> None:
+        """Rejoin remembered Discord voice channels after gateway restart.
+
+        Discord voice sockets are not durable across process restarts, but the
+        user expectation for `/voice join` is persistent live voice mode.  This
+        best-effort restore reconnects to the previous voice channel and rebinds
+        it to the remembered text channel/session.
+        """
+        if not hasattr(adapter, "join_voice_channel") or not hasattr(adapter, "_client"):
+            return
+        if hasattr(adapter, "_voice_input_callback"):
+            adapter._voice_input_callback = self._handle_voice_channel_input
+        if hasattr(adapter, "_on_voice_disconnect"):
+            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+
+        for guild_key, entry in self._load_active_voice_channels().items():
+            try:
+                guild_id = int(entry.get("guild_id") or guild_key)
+                voice_channel_id = int(entry["voice_channel_id"])
+                text_channel_id = str(entry["text_channel_id"])
+                channel = adapter._client.get_channel(voice_channel_id)
+                if channel is None:
+                    channel = await adapter._client.fetch_channel(voice_channel_id)
+                if channel is None:
+                    logger.warning("Voice restore: channel %s not found", voice_channel_id)
+                    continue
+                success = await adapter.join_voice_channel(channel)
+                if not success:
+                    logger.warning("Voice restore: failed to rejoin channel %s", voice_channel_id)
+                    continue
+                adapter._voice_text_channels[guild_id] = int(text_channel_id)
+                if hasattr(adapter, "_voice_sources") and isinstance(entry.get("source"), dict):
+                    adapter._voice_sources[guild_id] = entry["source"]
+                self._voice_mode[text_channel_id] = self._voice_mode.get(text_channel_id, "all")
+                if self._voice_mode[text_channel_id] == "off":
+                    self._voice_mode[text_channel_id] = "all"
+                self._save_voice_modes()
+                self._set_adapter_auto_tts_for_voice_mode(adapter, text_channel_id, self._voice_mode[text_channel_id])
+                self._schedule_voice_tts_warmup()
+                logger.warning(
+                    "Voice restore: rejoined guild_id=%s voice_channel_id=%s text_channel_id=%s mode=%s",
+                    guild_id, voice_channel_id, text_channel_id, self._voice_mode[text_channel_id],
+                )
+            except Exception as e:
+                logger.warning("Voice restore failed for guild %s: %s", guild_key, e, exc_info=True)
 
     # -----------------------------------------------------------------
 
@@ -1864,6 +1961,8 @@ class GatewayRunner:
                 if success:
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
+                    if platform == Platform.DISCORD:
+                        await self._restore_active_voice_channels(adapter)
                     connected_count += 1
                     self._update_platform_runtime_status(
                         platform.value,
@@ -2199,6 +2298,8 @@ class GatewayRunner:
                     if success:
                         self.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
+                        if platform == Platform.DISCORD:
+                            await self._restore_active_voice_channels(adapter)
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
@@ -5163,7 +5264,7 @@ class GatewayRunner:
             self._voice_mode[chat_id] = "voice_only"
             self._save_voice_modes()
             if adapter:
-                self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
+                self._set_adapter_auto_tts_for_voice_mode(adapter, chat_id, "voice_only")
             return (
                 "Voice mode enabled.\n"
                 "I'll reply with voice when you send voice messages.\n"
@@ -5179,7 +5280,7 @@ class GatewayRunner:
             self._voice_mode[chat_id] = "all"
             self._save_voice_modes()
             if adapter:
-                self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
+                self._set_adapter_auto_tts_for_voice_mode(adapter, chat_id, "all")
             return (
                 "Auto-TTS enabled.\n"
                 "All replies will include a voice message."
@@ -5218,7 +5319,7 @@ class GatewayRunner:
                 self._voice_mode[chat_id] = "voice_only"
                 self._save_voice_modes()
                 if adapter:
-                    self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=False)
+                    self._set_adapter_auto_tts_for_voice_mode(adapter, chat_id, "voice_only")
                 return "Voice mode enabled."
             else:
                 self._voice_mode[chat_id] = "off"
@@ -5268,9 +5369,16 @@ class GatewayRunner:
             adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
             if hasattr(adapter, "_voice_sources"):
                 adapter._voice_sources[guild_id] = event.source.to_dict()
+            self._remember_active_voice_channel(
+                guild_id=guild_id,
+                voice_channel_id=voice_channel.id,
+                text_channel_id=event.source.chat_id,
+                source=event.source,
+            )
             self._voice_mode[event.source.chat_id] = "all"
             self._save_voice_modes()
-            self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=False)
+            self._set_adapter_auto_tts_for_voice_mode(adapter, event.source.chat_id, "all")
+            self._schedule_voice_tts_warmup()
             return (
                 f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
@@ -5297,6 +5405,7 @@ class GatewayRunner:
         # Always clean up state even if leave raised an exception
         self._voice_mode[event.source.chat_id] = "off"
         self._save_voice_modes()
+        self._forget_active_voice_channel(guild_id)
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
@@ -5309,6 +5418,11 @@ class GatewayRunner:
         """
         self._voice_mode[chat_id] = "off"
         self._save_voice_modes()
+        active = self._load_active_voice_channels()
+        for guild_key, entry in list(active.items()):
+            if str(entry.get("text_channel_id")) == str(chat_id):
+                active.pop(guild_key, None)
+        self._save_active_voice_channels(active)
         adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
 
@@ -5362,9 +5476,14 @@ class GatewayRunner:
         # Use SimpleNamespace as raw_message so _get_guild_id() can extract
         # guild_id and _send_voice_reply() plays audio in the voice channel.
         from types import SimpleNamespace
+        voice_prompt = (
+            f"{transcript}\n\n"
+            "[Voice chat instruction: reply conversationally and briefly, ideally 1-3 short spoken sentences. "
+            "If the answer needs details, give a concise voice summary and put the detailed version in text.]"
+        )
         event = MessageEvent(
             source=source,
-            text=transcript,
+            text=voice_prompt,
             message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
         )
@@ -5389,10 +5508,15 @@ class GatewayRunner:
           in which case the base adapter won't have text for auto-TTS so the
           runner must handle it.
         """
-        if not response or response.startswith("Error:"):
+        chat_id = event.source.chat_id
+        response_present = bool(response and not response.startswith("Error:"))
+        if not response_present:
+            logger.warning(
+                "Voice reply decision: skip no_response platform=%s chat_id=%s msg_type=%s already_sent=%s",
+                event.source.platform, chat_id, getattr(event.message_type, "value", event.message_type), already_sent,
+            )
             return False
 
-        chat_id = event.source.chat_id
         voice_mode = self._voice_mode.get(chat_id, "off")
         is_voice_input = (event.message_type == MessageType.VOICE)
 
@@ -5401,9 +5525,16 @@ class GatewayRunner:
             or (voice_mode == "voice_only" and is_voice_input)
         )
         if not should:
+            logger.warning(
+                "Voice reply decision: skip mode_off platform=%s chat_id=%s voice_mode=%s msg_type=%s already_sent=%s",
+                event.source.platform, chat_id, voice_mode, getattr(event.message_type, "value", event.message_type), already_sent,
+            )
             return False
 
-        # Dedup: agent already called TTS tool
+        # Dedup: agent already called TTS tool.  For Discord voice input, do not
+        # let tool-call media delivery be the only spoken path: that path can
+        # upload short/silent voice-message attachments.  The runner should still
+        # synthesize and play the final response directly in the active VC.
         has_agent_tts = any(
             msg.get("role") == "assistant"
             and any(
@@ -5412,63 +5543,233 @@ class GatewayRunner:
             )
             for msg in agent_messages
         )
-        if has_agent_tts:
+        if has_agent_tts and not is_voice_input:
+            logger.warning(
+                "Voice reply decision: skip agent_tts platform=%s chat_id=%s voice_mode=%s msg_type=%s already_sent=%s",
+                event.source.platform, chat_id, voice_mode, getattr(event.message_type, "value", event.message_type), already_sent,
+            )
             return False
 
-        # Dedup: base adapter auto-TTS already handles voice input
-        # (play_tts plays in VC when connected, so runner can skip).
-        # When streaming already delivered the text (already_sent=True),
-        # the base adapter will receive None and can't run auto-TTS,
-        # so the runner must take over.
-        if is_voice_input and not already_sent:
-            return False
+        # The runner owns voice-input TTS.  The base adapter's generic auto-TTS
+        # is suppressed while voice mode is on to avoid duplicate/broken clips.
 
+        logger.warning(
+            "Voice reply decision: send platform=%s chat_id=%s voice_mode=%s msg_type=%s already_sent=%s response_chars=%d",
+            event.source.platform, chat_id, voice_mode, getattr(event.message_type, "value", event.message_type), already_sent, len(response),
+        )
         return True
+
+    def _split_voice_tts_text(self, text: str, max_chars: int = 420) -> list[str]:
+        """Split TTS text into stable spoken chunks.
+
+        NeuTTS can truncate or produce tiny files for longer live replies when
+        asked to synthesize one large paragraph.  Chunking by sentence keeps each
+        synthesis short, lets playback start earlier, and ensures the full text
+        is spoken instead of only the first fragment.
+        """
+        import re
+
+        normalized = re.sub(r"\s+", " ", text or "").strip()
+        if not normalized:
+            return []
+
+        sentences = re.split(r"(?<=[.!?])\s+", normalized)
+        chunks: list[str] = []
+        current = ""
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if len(sentence) > max_chars:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                parts = re.split(r"(?<=[,;:])\s+", sentence)
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if len(part) > max_chars:
+                        for i in range(0, len(part), max_chars):
+                            chunks.append(part[i:i + max_chars].strip())
+                    elif chunks and len(chunks[-1]) + 1 + len(part) <= max_chars:
+                        chunks[-1] = f"{chunks[-1]} {part}"
+                    else:
+                        chunks.append(part)
+                continue
+            candidate = f"{current} {sentence}".strip() if current else sentence
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                if current:
+                    chunks.append(current)
+                current = sentence
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _schedule_voice_tts_warmup(self) -> None:
+        """Warm the configured TTS engine after joining Discord voice.
+
+        NeuTTS is slow only on cold load. Warming it immediately after voice
+        join/rejoin moves that cost out of the first live user interaction.
+        """
+        if self._voice_tts_warm_task and not self._voice_tts_warm_task.done():
+            return
+
+        async def _warm() -> None:
+            import uuid as _uuid
+            warm_path = os.path.join(
+                tempfile.gettempdir(), "hermes_voice",
+                f"tts_warm_{_uuid.uuid4().hex[:8]}.mp3",
+            )
+            paths = {warm_path, warm_path.rsplit(".", 1)[0] + ".wav", warm_path.rsplit(".", 1)[0] + ".ogg"}
+            try:
+                os.makedirs(os.path.dirname(warm_path), exist_ok=True)
+                from tools.tts_tool import text_to_speech_tool
+                logger.warning("Voice TTS warmup: starting")
+                result_json = await asyncio.to_thread(
+                    text_to_speech_tool,
+                    text="Voice warmup.",
+                    output_path=warm_path,
+                )
+                try:
+                    result = json.loads(result_json)
+                except Exception:
+                    result = {}
+                file_path = result.get("file_path")
+                if file_path:
+                    paths.add(file_path)
+                logger.warning("Voice TTS warmup: complete success=%s provider=%s", result.get("success"), result.get("provider"))
+            except Exception as e:
+                logger.warning("Voice TTS warmup failed: %s", e, exc_info=True)
+            finally:
+                for p in paths - {None}:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
+        self._voice_tts_warm_task = asyncio.create_task(_warm())
+        self._background_tasks.add(self._voice_tts_warm_task)
+        self._voice_tts_warm_task.add_done_callback(self._background_tasks.discard)
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         import uuid as _uuid
-        audio_path = None
-        actual_path = None
+        cleanup_paths = set()
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
             tts_text = _strip_markdown_for_tts(text[:4000])
             if not tts_text:
+                logger.warning("Voice reply send: skip empty_tts_text platform=%s chat_id=%s", event.source.platform, event.source.chat_id)
                 return
 
-            # Use .mp3 extension so edge-tts conversion to opus works correctly.
-            # The TTS tool may convert to .ogg — use file_path from result.
-            audio_path = os.path.join(
-                tempfile.gettempdir(), "hermes_voice",
-                f"tts_reply_{_uuid.uuid4().hex[:12]}.mp3",
-            )
-            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-
-            result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=tts_text, output_path=audio_path
-            )
-            result = json.loads(result_json)
-
-            # Use the actual file path from result (may differ after opus conversion)
-            actual_path = result.get("file_path", audio_path)
-            if not result.get("success") or not os.path.isfile(actual_path):
-                logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
+            chunks = self._split_voice_tts_text(tts_text)
+            if not chunks:
+                logger.warning("Voice reply send: skip no_chunks platform=%s chat_id=%s", event.source.platform, event.source.chat_id)
                 return
+
+            logger.warning(
+                "Voice reply send: generating_tts platform=%s chat_id=%s chars=%d chunks=%d",
+                event.source.platform, event.source.chat_id, len(tts_text), len(chunks),
+            )
 
             adapter = self.adapters.get(event.source.platform)
-
-            # If connected to a voice channel, play there instead of sending a file
             guild_id = self._get_guild_id(event)
+            in_vc = bool(
+                guild_id
+                and hasattr(adapter, "is_in_voice_channel")
+                and adapter.is_in_voice_channel(guild_id)
+            )
+
+            synthesized: list[tuple[int, str]] = []
+            for idx, chunk in enumerate(chunks, start=1):
+                # Use .mp3 extension so edge-tts conversion to opus works correctly.
+                # The TTS tool may convert to .ogg — use file_path from result.
+                audio_path = os.path.join(
+                    tempfile.gettempdir(), "hermes_voice",
+                    f"tts_reply_{_uuid.uuid4().hex[:12]}_{idx:02d}.mp3",
+                )
+                os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+                cleanup_paths.add(audio_path)
+
+                result_json = await asyncio.to_thread(
+                    text_to_speech_tool, text=chunk, output_path=audio_path
+                )
+                result = json.loads(result_json)
+
+                actual_path = result.get("file_path", audio_path)
+                cleanup_paths.add(actual_path)
+                if not result.get("success") or not os.path.isfile(actual_path):
+                    logger.warning("Auto voice reply TTS failed chunk=%d/%d: %s", idx, len(chunks), result.get("error"))
+                    continue
+
+                synthesized.append((idx, actual_path))
+                logger.warning(
+                    "Voice reply send: tts_ready platform=%s chat_id=%s guild_id=%s in_vc=%s chunk=%d/%d chars=%d path_exists=%s",
+                    event.source.platform, event.source.chat_id, guild_id, in_vc, idx, len(chunks), len(chunk), os.path.isfile(actual_path),
+                )
+
+            if not synthesized:
+                logger.warning("Voice reply send: no synthesized chunks platform=%s chat_id=%s", event.source.platform, event.source.chat_id)
+                return
+
+            playback_path = synthesized[0][1]
+            playback_label = "single"
+            if len(synthesized) > 1:
+                import subprocess as _subprocess
+                import shlex as _shlex
+                list_path = os.path.join(
+                    tempfile.gettempdir(), "hermes_voice",
+                    f"tts_concat_{_uuid.uuid4().hex[:12]}.txt",
+                )
+                joined_path = os.path.join(
+                    tempfile.gettempdir(), "hermes_voice",
+                    f"tts_joined_{_uuid.uuid4().hex[:12]}.ogg",
+                )
+                cleanup_paths.update({list_path, joined_path})
+                with open(list_path, "w", encoding="utf-8") as f:
+                    for _, p in synthesized:
+                        f.write(f"file {_shlex.quote(p)}\n")
+                try:
+                    _subprocess.run(
+                        [
+                            "ffmpeg", "-y", "-loglevel", "error",
+                            "-f", "concat", "-safe", "0", "-i", list_path,
+                            "-c:a", "libopus", "-b:a", "64k", joined_path,
+                        ],
+                        check=True,
+                        timeout=60,
+                    )
+                    if os.path.isfile(joined_path) and os.path.getsize(joined_path) > 0:
+                        playback_path = joined_path
+                        playback_label = f"joined:{len(synthesized)}"
+                        logger.warning(
+                            "Voice reply send: concat_ready platform=%s chat_id=%s chunks=%d path_exists=%s",
+                            event.source.platform, event.source.chat_id, len(synthesized), os.path.isfile(joined_path),
+                        )
+                except Exception as e:
+                    logger.warning("Voice reply send: concat_failed chunks=%d error=%s", len(synthesized), e, exc_info=True)
+
             if (guild_id
                     and hasattr(adapter, "play_in_voice_channel")
                     and hasattr(adapter, "is_in_voice_channel")
                     and adapter.is_in_voice_channel(guild_id)):
-                await adapter.play_in_voice_channel(guild_id, actual_path)
+                play_success = await adapter.play_in_voice_channel(guild_id, playback_path)
+                logger.warning(
+                    "Voice reply send: play_attempted platform=%s chat_id=%s guild_id=%s playback=%s success=%s",
+                    event.source.platform, event.source.chat_id, guild_id, playback_label, play_success,
+                )
             elif adapter and hasattr(adapter, "send_voice"):
+                logger.warning(
+                    "Voice reply send: fallback_send_voice platform=%s chat_id=%s guild_id=%s in_vc=%s playback=%s",
+                    event.source.platform, event.source.chat_id, guild_id, in_vc, playback_label,
+                )
                 send_kwargs: Dict[str, Any] = {
                     "chat_id": event.source.chat_id,
-                    "audio_path": actual_path,
+                    "audio_path": playback_path,
                     "reply_to": event.message_id,
                 }
                 if event.source.thread_id:
@@ -5477,7 +5778,7 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
-            for p in {audio_path, actual_path} - {None}:
+            for p in cleanup_paths - {None}:
                 try:
                     os.unlink(p)
                 except OSError:

@@ -2,13 +2,14 @@
 """
 Text-to-Speech Tool Module
 
-Supports six TTS providers:
+Supports seven TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
 - MiniMax TTS: High-quality with voice cloning, needs MINIMAX_API_KEY
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
+- Local HTTP: OpenAI-compatible local TTS server (Coqui/XTTS, Piper, VibeVoice, etc.)
 
 Output formats:
 - Opus (.ogg) for Telegram voice bubbles (requires ffmpeg for Edge TTS)
@@ -93,6 +94,9 @@ DEFAULT_MINIMAX_VOICE_ID = "English_Graceful_Lady"
 DEFAULT_MINIMAX_BASE_URL = "https://api.minimax.io/v1/t2a_v2"
 DEFAULT_MISTRAL_TTS_MODEL = "voxtral-mini-tts-2603"
 DEFAULT_MISTRAL_TTS_VOICE_ID = "c69964a6-ab8b-4f8a-9465-ec0925096ec8"  # Paul - Neutral
+DEFAULT_LOCAL_HTTP_BASE_URL = "http://127.0.0.1:8020/v1"
+DEFAULT_LOCAL_HTTP_MODEL = "local-tts"
+DEFAULT_LOCAL_HTTP_VOICE = "default"
 
 def _get_default_output_dir() -> str:
     from hermes_constants import get_hermes_dir
@@ -436,8 +440,88 @@ def _generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any
 
 
 # ===========================================================================
+# Provider: Local HTTP (OpenAI-compatible local TTS server)
+# ===========================================================================
+
+def _tts_response_format_from_path(output_path: str) -> str:
+    """Map output extension to common OpenAI-compatible TTS response_format."""
+    ext = Path(output_path).suffix.lower().lstrip(".")
+    if ext in ("ogg", "opus"):
+        return "opus"
+    if ext in ("wav", "mp3", "flac"):
+        return ext
+    return "mp3"
+
+
+def _generate_local_http_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech with a local OpenAI-compatible HTTP TTS server.
+
+    This is intentionally engine-agnostic. A local service can wrap Coqui/XTTS,
+    Piper, VibeVoice, or another engine as long as it accepts an OpenAI-style
+    ``POST /v1/audio/speech`` request and returns audio bytes.
+    """
+    import requests
+
+    local_config = tts_config.get("local_http", {})
+    endpoint = (local_config.get("endpoint") or "").strip()
+    if not endpoint:
+        base_url = (local_config.get("base_url") or DEFAULT_LOCAL_HTTP_BASE_URL).rstrip("/")
+        endpoint = f"{base_url}/audio/speech"
+
+    model = local_config.get("model") or DEFAULT_LOCAL_HTTP_MODEL
+    voice = local_config.get("voice") or DEFAULT_LOCAL_HTTP_VOICE
+    timeout = float(local_config.get("timeout", 60))
+    response_format = local_config.get("response_format") or _tts_response_format_from_path(output_path)
+
+    payload: Dict[str, Any] = {
+        "model": model,
+        "input": text,
+        "voice": voice,
+        "response_format": response_format,
+    }
+    speed = local_config.get("speed", tts_config.get("speed"))
+    if speed is not None:
+        payload["speed"] = float(speed)
+    extra_body = local_config.get("extra_body") or {}
+    if isinstance(extra_body, dict):
+        payload.update(extra_body)
+
+    headers = {"Accept": "audio/*"}
+    api_key = local_config.get("api_key") or os.getenv("LOCAL_TTS_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=timeout)
+        response.raise_for_status()
+    except Exception as e:
+        status = getattr(locals().get("response", None), "status_code", None)
+        if status:
+            raise RuntimeError(f"Local HTTP TTS failed: HTTP {status}") from e
+        raise RuntimeError(f"Local HTTP TTS failed: {type(e).__name__}") from e
+
+    audio_bytes = response.content or b""
+    content_type = (response.headers or {}).get("content-type", "")
+    if "application/json" in content_type.lower():
+        raise RuntimeError("Local HTTP TTS returned JSON instead of audio")
+    if not audio_bytes:
+        raise RuntimeError("Local HTTP TTS returned empty audio")
+
+    with open(output_path, "wb") as f:
+        f.write(audio_bytes)
+
+    return output_path
+
+
+# ===========================================================================
 # NeuTTS (local, on-device TTS via neutts_cli)
 # ===========================================================================
+
+_NEUTTS_ENGINE_CACHE = None
+_NEUTTS_ENGINE_KEY = None
+_NEUTTS_REF_CODES = None
+_NEUTTS_REF_TEXT = None
+_NEUTTS_LOCK = None
 
 def _check_neutts_available() -> bool:
     """Check if the neutts engine is importable (installed locally)."""
@@ -456,6 +540,74 @@ def _default_neutts_ref_audio() -> str:
 def _default_neutts_ref_text() -> str:
     """Return path to the bundled default voice reference transcript."""
     return str(Path(__file__).parent / "neutts_samples" / "jo.txt")
+
+
+def _write_neutts_wav(path: str, samples, sample_rate: int = 24000) -> None:
+    """Write NeuTTS float samples to a WAV file."""
+    try:
+        import soundfile as sf
+        sf.write(path, samples, sample_rate)
+        return
+    except ImportError:
+        pass
+
+    import wave
+    import numpy as np
+    samples = np.asarray(samples, dtype=np.float32).flatten()
+    samples = np.clip(samples, -1.0, 1.0)
+    pcm = (samples * 32767).astype(np.int16)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.tobytes())
+
+
+def _get_neutts_lock():
+    global _NEUTTS_LOCK
+    if _NEUTTS_LOCK is None:
+        import threading
+        _NEUTTS_LOCK = threading.Lock()
+    return _NEUTTS_LOCK
+
+
+def _generate_neutts_inprocess(text: str, wav_path: str, ref_audio: str, ref_text: str, model: str, device: str) -> None:
+    """Generate NeuTTS speech using a cached in-process model.
+
+    The old subprocess path reloads the model every utterance, which makes live
+    Discord voice replies take 20-30s.  The gateway calls TTS from a worker
+    thread, so keeping one cached engine in-process gives warm replies without
+    blocking the event loop.  A lock serializes access because the NeuTTS object
+    is not documented as thread-safe.
+    """
+    global _NEUTTS_ENGINE_CACHE, _NEUTTS_ENGINE_KEY, _NEUTTS_REF_CODES, _NEUTTS_REF_TEXT
+
+    ref_audio = str(Path(ref_audio).expanduser())
+    ref_text = str(Path(ref_text).expanduser())
+    key = (model, device, ref_audio, ref_text)
+
+    with _get_neutts_lock():
+        if _NEUTTS_ENGINE_CACHE is None or _NEUTTS_ENGINE_KEY != key:
+            from neutts import NeuTTS
+            logger.warning("NeuTTS warm load starting model=%s device=%s ref_audio=%s", model, device, ref_audio)
+            tts = NeuTTS(
+                backbone_repo=model,
+                backbone_device=device,
+                codec_repo="neuphonic/neucodec",
+                codec_device=device,
+            )
+            # Local live voice does not need Perth watermarking, and Perth can
+            # crash short replies with STFT padding errors.
+            if getattr(tts, "watermarker", None) is not None:
+                tts.watermarker = None
+            _NEUTTS_ENGINE_CACHE = tts
+            _NEUTTS_ENGINE_KEY = key
+            _NEUTTS_REF_CODES = tts.encode_reference(ref_audio)
+            _NEUTTS_REF_TEXT = Path(ref_text).read_text(encoding="utf-8").strip()
+            logger.warning("NeuTTS warm load complete")
+
+        wav = _NEUTTS_ENGINE_CACHE.infer(text, _NEUTTS_REF_CODES, _NEUTTS_REF_TEXT)
+        _write_neutts_wav(wav_path, wav, 24000)
 
 
 def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
@@ -479,23 +631,27 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     if not output_path.endswith(".wav"):
         wav_path = output_path.rsplit(".", 1)[0] + ".wav"
 
-    synth_script = str(Path(__file__).parent / "neutts_synth.py")
-    cmd = [
-        sys.executable, synth_script,
-        "--text", text,
-        "--out", wav_path,
-        "--ref-audio", ref_audio,
-        "--ref-text", ref_text,
-        "--model", model,
-        "--device", device,
-    ]
+    persistent = str(neutts_config.get("persistent", os.getenv("HERMES_NEUTTS_PERSISTENT", "true"))).lower() not in ("0", "false", "no")
+    if persistent:
+        _generate_neutts_inprocess(text, wav_path, ref_audio, ref_text, model, device)
+    else:
+        synth_script = str(Path(__file__).parent / "neutts_synth.py")
+        cmd = [
+            sys.executable, synth_script,
+            "--text", text,
+            "--out", wav_path,
+            "--ref-audio", ref_audio,
+            "--ref-text", ref_text,
+            "--model", model,
+            "--device", device,
+        ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        # Filter out the "OK:" line from stderr
-        error_lines = [l for l in stderr.splitlines() if not l.startswith("OK:")]
-        raise RuntimeError(f"NeuTTS synthesis failed: {chr(10).join(error_lines) or 'unknown error'}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            # Filter out the "OK:" line from stderr
+            error_lines = [l for l in stderr.splitlines() if not l.startswith("OK:")]
+            raise RuntimeError(f"NeuTTS synthesis failed: {chr(10).join(error_lines) or 'unknown error'}")
 
     # If the caller wanted .mp3 or .ogg, convert from WAV
     if wav_path != output_path:
@@ -563,7 +719,7 @@ def text_to_speech_tool(
         out_dir.mkdir(parents=True, exist_ok=True)
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        if want_opus and provider in ("openai", "elevenlabs", "mistral"):
+        if want_opus and provider in ("openai", "elevenlabs", "mistral", "local_http"):
             file_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
@@ -622,6 +778,10 @@ def text_to_speech_tool(
             logger.info("Generating speech with NeuTTS (local)...")
             _generate_neutts(text, file_str, tts_config)
 
+        elif provider == "local_http":
+            logger.info("Generating speech with local HTTP TTS...")
+            _generate_local_http_tts(text, file_str, tts_config)
+
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
             edge_available = True
@@ -666,7 +826,7 @@ def text_to_speech_tool(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in ("elevenlabs", "openai", "mistral"):
+        elif provider in ("elevenlabs", "openai", "mistral", "local_http"):
             voice_compatible = file_str.endswith(".ogg")
 
         file_size = os.path.getsize(file_str)
