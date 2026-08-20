@@ -141,6 +141,10 @@ VALID_HOOKS: Set[str] = {
     # Plugins return a string to replace the response text, or None/empty to leave unchanged.
     # First non-None string wins. Useful for vocabulary/personality transformation.
     "transform_llm_output",
+    # Transform text sent to TTS without changing the written assistant response.
+    # Plugins return a string to replace the spoken text, or None/empty to leave unchanged.
+    # First non-empty string wins. Useful for spoken briefs and TTS sanitization.
+    "transform_tts_text",
     "pre_llm_call",
     "post_llm_call",
     # Verification-loop gate. Fired once per turn when the agent has edited code

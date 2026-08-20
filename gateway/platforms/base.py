@@ -3358,9 +3358,14 @@ class BasePlatformAdapter(ABC):
     def prepare_tts_text(self, text: str) -> str:
         """Prepare text for TTS. Override to filter tool output, code, etc.
 
-        Default strips markdown formatting and truncates to 4000 chars.
+        Speech sanitization must run before destructive markdown cleanup so
+        fenced code, inline code, paths, and filenames are replaced with
+        speakable labels instead of exposed to the TTS provider.
         """
-        return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
+        from tools.voice_interactions import sanitize_for_speech
+
+        speech_text = sanitize_for_speech(text)
+        return re.sub(r'[*_`#\[\]()]', '', speech_text)[:4000].strip()
 
     async def play_tts(
         self,

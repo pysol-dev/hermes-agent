@@ -2479,6 +2479,64 @@ class GatewaySlashCommandsMixin:
             )
             return t("gateway.voice.help", toggle=toggle_line, channels=channels)
 
+    async def _handle_voiceclone_command(self, event: MessageEvent) -> str:
+        """Run/open the voice-clone audition workflow.
+
+        If the triggering message includes an audio attachment, this is an
+        end-to-end workflow: create the local reference profile, synthesize the
+        four audition samples, then open the candidate-aware effect panel.  With
+        no audio attachment, fall back to opening the current effect panel.
+        """
+        adapter = self.adapters.get(event.source.platform)
+        metadata = self._thread_metadata_for_source(event.source)
+        audio_paths = []
+        for i, path in enumerate(getattr(event, "media_urls", None) or []):
+            mtype = event.media_types[i] if i < len(event.media_types) else ""
+            if event.message_type == MessageType.AUDIO or mtype.startswith("audio/"):
+                audio_paths.append(path)
+        if audio_paths:
+            try:
+                from tools.voice_clone_workspace import create_voice_clone_workspace
+
+                chat_key = self._session_key_for_source(event.source)
+                workspace = create_voice_clone_workspace(
+                    audio_paths[0],
+                    chat_key=chat_key,
+                    requested_name=event.get_command_args().strip() or None,
+                )
+                if adapter and hasattr(adapter, "send_voice_clone_panel"):
+                    result = await adapter.send_voice_clone_panel(
+                        str(event.source.chat_id),
+                        metadata=metadata,
+                        workspace=workspace,
+                    )
+                    if getattr(result, "success", False):
+                        return "Voice clone generated. I sent four audition samples and opened the candidate/effects panel."
+                    err = getattr(result, "error", "unknown error")
+                    return f"Voice clone generated, but I couldn't open the interactive panel: {err}"
+                from tools.voice_clone_workspace import render_workspace_text
+                return render_workspace_text(workspace)
+            except Exception as exc:
+                logger.warning("voiceclone workflow failed: %s", exc, exc_info=True)
+                return f"Voice-clone workflow failed: {exc}"
+        if adapter and hasattr(adapter, "send_voice_clone_panel"):
+            try:
+                result = await adapter.send_voice_clone_panel(
+                    str(event.source.chat_id),
+                    metadata=metadata,
+                )
+                if getattr(result, "success", False):
+                    return "Opened voice-clone effect controls. Changes apply to the next TTS reply."
+                err = getattr(result, "error", "unknown error")
+                return f"Couldn't open interactive voice-clone controls: {err}"
+            except Exception as exc:
+                logger.warning("voiceclone panel failed: %s", exc, exc_info=True)
+        try:
+            from tools.voice_clone_effect_panel import render_panel_text
+            return render_panel_text()
+        except Exception as exc:
+            return f"Voice-clone controls unavailable: {exc}"
+
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
         from gateway.run import _hermes_home

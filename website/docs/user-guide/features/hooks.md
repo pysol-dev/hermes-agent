@@ -395,6 +395,7 @@ def register(ctx):
 | [`transform_tool_result`](#transform_tool_result) | After any tool returns, before the result is handed back to the model | `str` to replace the result, `None` to leave unchanged |
 | [`transform_terminal_output`](#transform_terminal_output) | Inside the `terminal` tool, before truncation/ANSI-strip/redact | `str` to replace the raw output, `None` to leave unchanged |
 | [`transform_llm_output`](#transform_llm_output) | After the tool-calling loop completes, before the final response is delivered | `str` to replace the response text, `None`/empty to leave unchanged |
+| [`transform_tts_text`](#transform_tts_text) | Before an automatic gateway voice reply is synthesized | `str` to replace the spoken TTS text only, `None`/empty to leave unchanged |
 
 ---
 
@@ -1277,6 +1278,29 @@ def register(ctx):
 ```
 
 The hook is guarded on a non-empty, non-interrupted response — it will not fire on stop-button interrupts or empty turns. Exceptions are logged as warnings and do not break agent execution.
+
+---
+
+### `transform_tts_text`
+
+Fires before an automatic gateway voice reply is synthesized, after Hermes has the final written assistant response but before markdown stripping and TTS generation. This lets a plugin shorten or sanitize the spoken version while preserving the complete text response in chat.
+
+**Callback signature:**
+
+```python
+def my_callback(
+    response_text: str,
+    tts_text: str,
+    platform: str,
+    chat_id: str,
+    message_type: str,
+    **kwargs,
+) -> str | None:
+```
+
+Return a non-empty string to replace only the spoken TTS text. Return `None` or an empty string to keep the original response text for speech. The first non-empty string wins.
+
+Use cases: spoken briefs for voice chat, TTS-only redaction of file paths or URLs, deterministic shortening of long technical answers, and voice persona phrasing that should not alter the written response.
 
 ---
 
