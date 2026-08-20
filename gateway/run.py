@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Union
+from typing import Callable, Dict, Optional, Any, List, Union, Final
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -1373,6 +1373,17 @@ def _restart_notification_pending() -> bool:
     return (_hermes_home / ".restart_notify.json").exists()
 
 
+_RESTART_NOTIFICATION_DEGRADED_ERROR: Final = "send_path_degraded"
+_RESTART_NOTIFICATION_RETRY_DELAYS: Final = (1.0, 2.0, 5.0, 10.0)
+
+
+def _restart_notification_hit_send_path_degraded(result: "SendResult") -> bool:
+    return (
+        getattr(result, "success", True) is False
+        and getattr(result, "error", None) == _RESTART_NOTIFICATION_DEGRADED_ERROR
+    )
+
+
 def _planned_restart_notification_path() -> Path:
     return _hermes_home / ".restart_pending.json"
 
@@ -1912,6 +1923,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    SendResult,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     merge_pending_message_event,
@@ -15389,6 +15401,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not notify_path.exists():
             return None
 
+        cleanup_marker = True
         try:
             data = json.loads(notify_path.read_text())
             platform_str = data.get("platform")
@@ -15435,6 +15448,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # we must inspect the result before claiming success — otherwise
             # the log line is misleading and hides real delivery failures.
             if result is not None and getattr(result, "success", True) is False:
+                if _restart_notification_hit_send_path_degraded(result):
+                    logger.warning(
+                        "Restart notification deferred: Telegram send path degraded"
+                    )
+                    cleanup_marker = False
+                    self._schedule_restart_notification_retry()
+                    return None
                 logger.warning(
                     "Restart notification to %s:%s was not delivered: %s",
                     platform_str,
@@ -15449,11 +15469,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id,
             )
             return str(platform_str), str(chat_id), str(thread_id) if thread_id else None
+        except asyncio.CancelledError:
+            cleanup_marker = False
+            raise
         except Exception as e:
             logger.warning("Restart notification failed: %s", e)
             return None
         finally:
-            notify_path.unlink(missing_ok=True)
+            if cleanup_marker:
+                notify_path.unlink(missing_ok=True)
+
+    def _schedule_restart_notification_retry(self) -> None:
+        existing_task = getattr(self, "_restart_notification_retry_task", None)
+        if existing_task and not existing_task.done():
+            return
+
+        try:
+            task = asyncio.create_task(
+                self._retry_restart_notification_until_delivered()
+            )
+            self._restart_notification_retry_task = task
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except RuntimeError:
+            logger.debug(
+                "Skipping restart notification retry: no running event loop"
+            )
+
+    async def _retry_restart_notification_until_delivered(self) -> None:
+        for delay in _RESTART_NOTIFICATION_RETRY_DELAYS:
+            await asyncio.sleep(delay)
+            if not _restart_notification_pending():
+                return
+            if self._shutdown_event.is_set() or getattr(self, "_draining", False):
+                return
+            delivered = await self._send_restart_notification()
+            if delivered is not None:
+                return
+
+        if _restart_notification_pending():
+            logger.warning(
+                "Restart notification expired after Telegram send path stayed degraded"
+            )
+            (_hermes_home / ".restart_notify.json").unlink(missing_ok=True)
 
     async def _send_home_channel_startup_notifications(
         self,
