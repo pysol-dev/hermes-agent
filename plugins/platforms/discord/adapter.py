@@ -7879,6 +7879,64 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_choice_picker failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_voice_clone_panel(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        workspace: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send interactive voice-clone controls and workspace auditions."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        try:
+            if workspace is None:
+                from tools.voice_clone_workspace import create_effect_draft_workspace
+
+                workspace = create_effect_draft_workspace(f"{self.name}:{chat_id}")
+
+            target_id = str(metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id)
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+            if not channel:
+                return SendResult(success=False, error=f"Channel {target_id} not found")
+
+            from tools.voice_clone_workspace import render_workspace_text
+
+            sample_paths = [
+                s.get("path") for s in workspace.get("samples", [])
+                if s.get("ok") and s.get("path") and os.path.isfile(str(s.get("path")))
+            ]
+            if sample_paths:
+                await channel.send(
+                    "Generated local voice-clone audition samples:",
+                    files=[discord.File(str(p)) for p in sample_paths[:4]],
+                )
+            panel_text = render_workspace_text(workspace)
+
+            embed = discord.Embed(
+                title="🎛 Voice Clone Audition" if workspace.get("source_candidates") else "🎛 Voice Clone Effects",
+                description=panel_text[:4096],
+                color=discord.Color.blurple(),
+            )
+            if workspace:
+                embed.add_field(
+                    name="Safety",
+                    value="Promotion writes an inactive profile only; this panel never switches the active live voice.",
+                    inline=False,
+                )
+            view = VoiceCloneEffectsView(
+                allowed_user_ids=self._allowed_user_ids,
+                allowed_role_ids=self._allowed_role_ids,
+                workspace_id=workspace.get("id") if workspace else None,
+            )
+            msg = await channel.send(embed=embed, view=view)
+            view._message = msg
+            return SendResult(success=True, message_id=str(msg.id))
+        except Exception as e:
+            logger.warning("[%s] send_voice_clone_panel failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     def _get_parent_channel_id(self, channel: Any) -> Optional[str]:
         """Return the parent channel ID for a Discord thread-like channel, if present."""
         parent = getattr(channel, "parent", None)
@@ -8782,7 +8840,7 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView, VoiceCloneEffectsView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -9157,6 +9215,188 @@ def _define_discord_view_classes() -> None:
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
+
+    class VoiceCloneEffectsView(discord.ui.View):
+        """Interactive controls for local voice-clone workspace effects."""
+
+        def __init__(self, allowed_user_ids: set, allowed_role_ids: Optional[set] = None, workspace_id: Optional[str] = None):
+            super().__init__(timeout=None)
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+            self.workspace_id = workspace_id
+            self._rebuild_buttons()
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            return _component_check_auth(interaction, self.allowed_user_ids, self.allowed_role_ids)
+
+        def _workspace_state(self) -> tuple[dict, dict]:
+            if not self.workspace_id:
+                return {}, {}
+            try:
+                from tools.voice_clone_workspace import load_workspace
+                ws = load_workspace(self.workspace_id)
+                return ws, dict(ws.get("effect_state") or {})
+            except Exception:
+                return {}, {}
+
+        def _rebuild_buttons(self) -> None:
+            self.clear_items()
+            ws, state = self._workspace_state()
+            has_workspace = bool(self.workspace_id)
+            if has_workspace:
+                source_candidates = list(ws.get("source_candidates") or [])
+                samples = [s for s in (ws.get("samples") or []) if s.get("ok")]
+                if source_candidates and not samples:
+                    selected_source = int(ws.get("selected_source_candidate") or 0)
+                    for cand in source_candidates[:4]:
+                        idx = int(cand.get("index") or 0)
+                        btn = discord.ui.Button(
+                            label=("✅" if idx == selected_source else "⬜") + f" Source {idx}",
+                            style=discord.ButtonStyle.success if idx == selected_source else discord.ButtonStyle.secondary,
+                            custom_id=f"vcsrc:{self.workspace_id}:{idx}",
+                            row=0,
+                        )
+                        btn.callback = self._make_source_callback(idx)
+                        self.add_item(btn)
+                elif samples:
+                    selected = {int(x) for x in ws.get("selected_candidates", [])}
+                    for sample in samples[:4]:
+                        idx = int(sample.get("index") or 0)
+                        btn = discord.ui.Button(
+                            label=("✅" if idx in selected else "⬜") + f" Sample {idx}",
+                            style=discord.ButtonStyle.success if idx in selected else discord.ButtonStyle.secondary,
+                            custom_id=f"vccand:{self.workspace_id}:{idx}",
+                            row=0,
+                        )
+                        btn.callback = self._make_candidate_callback(idx)
+                        self.add_item(btn)
+            try:
+                from tools.voice_clone_effect_panel import button_labels, current_panel, controls_for_buttons
+                if not state:
+                    state = dict(current_panel()["state"])
+                controls = list(controls_for_buttons())
+            except Exception:
+                controls = []
+                button_labels = lambda ctrl, state=None: (f"− {ctrl.label} {ctrl.default}/10", f"+ {ctrl.label} {ctrl.default}/10")
+            # Workspace cards reserve row 0 for candidate selection and row 4 for
+            # reset/promote.  The full control state is still shown in the embed;
+            # direct /voiceclone panel (no workspace) renders all controls.
+            controls_to_render = controls[:6] if has_workspace else controls
+            for idx, ctrl in enumerate(controls_to_render):
+                row = min(4, (idx // 2) + (1 if has_workspace else 0))
+                minus_label, plus_label = button_labels(ctrl, state)
+                minus = discord.ui.Button(label=minus_label, style=discord.ButtonStyle.secondary, custom_id=f"vcfx:{self.workspace_id or '-'}:{ctrl.key}:-1", row=row)
+                plus = discord.ui.Button(label=plus_label, style=discord.ButtonStyle.primary, custom_id=f"vcfx:{self.workspace_id or '-'}:{ctrl.key}:1", row=row)
+                minus.callback = self._make_callback(ctrl.key, -1)
+                plus.callback = self._make_callback(ctrl.key, 1)
+                self.add_item(minus)
+                self.add_item(plus)
+            reset = discord.ui.Button(label="Reset safe baseline", style=discord.ButtonStyle.danger, custom_id=f"vcreset:{self.workspace_id or '-'}", row=4)
+            reset.callback = self._reset_callback
+            self.add_item(reset)
+            if has_workspace and ws.get("selected_source_candidate"):
+                promote = discord.ui.Button(label="Promote inactive profile", style=discord.ButtonStyle.success, custom_id=f"vcprom:{self.workspace_id}", row=4)
+                promote.callback = self._promote_callback
+                self.add_item(promote)
+
+        def _make_callback(self, control: str, delta: int):
+            async def _callback(interaction: discord.Interaction):
+                await self._adjust(interaction, control, delta)
+            return _callback
+
+        def _make_candidate_callback(self, index: int):
+            async def _callback(interaction: discord.Interaction):
+                await self._toggle_candidate(interaction, index)
+            return _callback
+
+        def _make_source_callback(self, index: int):
+            async def _callback(interaction: discord.Interaction):
+                await self._select_source(interaction, index)
+            return _callback
+
+        async def _select_source(self, interaction: discord.Interaction, index: int) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized to select voice sources~", ephemeral=True)
+                return
+            try:
+                from tools.voice_clone_workspace import render_workspace_text, select_source_candidate
+                ws = select_source_candidate(str(self.workspace_id), index)
+                self._rebuild_buttons()
+                embed = discord.Embed(title="🎛 Voice Clone Audition", description=render_workspace_text(ws)[:4096], color=discord.Color.blurple())
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception as exc:
+                logger.warning("Discord voice clone source select failed: %s", exc, exc_info=True)
+                await interaction.response.send_message(f"Could not select source: {exc}", ephemeral=True)
+
+        async def _toggle_candidate(self, interaction: discord.Interaction, index: int) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized to select voice candidates~", ephemeral=True)
+                return
+            try:
+                from tools.voice_clone_workspace import render_workspace_text, select_candidate
+                ws = select_candidate(str(self.workspace_id), index)
+                self._rebuild_buttons()
+                embed = discord.Embed(title="🎛 Voice Clone Audition", description=render_workspace_text(ws)[:4096], color=discord.Color.blurple())
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception as exc:
+                logger.warning("Discord voice clone candidate toggle failed: %s", exc, exc_info=True)
+                await interaction.response.send_message(f"Could not update candidate: {exc}", ephemeral=True)
+
+        async def _adjust(self, interaction: discord.Interaction, control: str, delta: int) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized to adjust voice effects~", ephemeral=True)
+                return
+            if not self.workspace_id:
+                await interaction.response.send_message("This voice-clone panel no longer has an inactive workspace. Open /voiceclone again.", ephemeral=True)
+                return
+            try:
+                from tools.voice_clone_workspace import apply_effect_delta, render_workspace_text
+                result = apply_effect_delta(str(self.workspace_id), control, delta)
+                panel_text = render_workspace_text(result["workspace"])
+                title = "🎛 Voice Clone Audition"
+                self._rebuild_buttons()
+                embed = discord.Embed(title=title, description=panel_text[:4096], color=discord.Color.blurple())
+                embed.set_footer(text=f"Updated {control}: {result['before']} → {result['after']}")
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception as exc:
+                logger.warning("Discord voice clone effect adjust failed: %s", exc, exc_info=True)
+                await interaction.response.send_message(f"Could not update effect: {exc}", ephemeral=True)
+
+        async def _reset_callback(self, interaction: discord.Interaction) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized to adjust voice effects~", ephemeral=True)
+                return
+            if not self.workspace_id:
+                await interaction.response.send_message("This voice-clone panel no longer has an inactive workspace. Open /voiceclone again.", ephemeral=True)
+                return
+            try:
+                from tools.voice_clone_workspace import render_workspace_text, reset_workspace_effects
+                ws = reset_workspace_effects(str(self.workspace_id))
+                panel_text = render_workspace_text(ws)
+                title = "🎛 Voice Clone Audition"
+                self._rebuild_buttons()
+                embed = discord.Embed(title=title, description=panel_text[:4096], color=discord.Color.blurple())
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception as exc:
+                logger.warning("Discord voice clone effect reset failed: %s", exc, exc_info=True)
+                await interaction.response.send_message(f"Could not reset effects: {exc}", ephemeral=True)
+
+        async def _promote_callback(self, interaction: discord.Interaction) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized to promote voice profiles~", ephemeral=True)
+                return
+            try:
+                from tools.voice_clone_workspace import promote_workspace, render_workspace_text
+                result = promote_workspace(str(self.workspace_id))
+                ws = result["workspace"]
+                self._rebuild_buttons()
+                embed = discord.Embed(title="🎛 Voice Clone Audition", description=render_workspace_text(ws)[:4096], color=discord.Color.blurple())
+                await interaction.response.edit_message(embed=embed, view=self)
+                await interaction.followup.send("Promoted as an inactive profile only; active TTS config was not changed.", ephemeral=True)
+            except Exception as exc:
+                logger.warning("Discord voice clone promote failed: %s", exc, exc_info=True)
+                await interaction.response.send_message(f"Could not promote profile: {exc}", ephemeral=True)
+
 
     class ModelPickerView(discord.ui.View):
         """Interactive select-menu view for model switching.

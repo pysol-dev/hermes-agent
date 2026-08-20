@@ -6442,6 +6442,80 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    def _voice_clone_keyboard(self, workspace: Optional[Dict[str, Any]] = None):
+        from tools.voice_clone_effect_panel import button_labels, controls_for_buttons, current_panel
+
+        state = dict(current_panel()["state"])
+        rows = []
+        if workspace:
+            state.update(workspace.get("effect_state") or {})
+            samples = [s for s in (workspace.get("samples") or []) if s.get("ok")]
+            if workspace.get("source_candidates") and not samples:
+                selected_source = int(workspace.get("selected_source_candidate") or 0)
+                rows.append([
+                    InlineKeyboardButton(("✅" if int(c.get("index") or 0) == selected_source else "⬜") + f" Source {int(c.get('index') or 0)}", callback_data=f"vcs:{int(c.get('index') or 0)}")
+                    for c in (workspace.get("source_candidates") or [])[:4]
+                ])
+            elif samples:
+                selected = {int(x) for x in workspace.get("selected_candidates", [])}
+                rows.append([
+                    InlineKeyboardButton(("✅" if int(s.get("index") or 0) in selected else "⬜") + f" Sample {int(s.get('index') or 0)}", callback_data=f"vcc:{int(s.get('index') or 0)}")
+                    for s in samples[:4]
+                ])
+        for ctrl in controls_for_buttons():
+            minus_label, plus_label = button_labels(ctrl, state)
+            rows.append([
+                InlineKeyboardButton(minus_label, callback_data=f"vcf:{ctrl.key}:-1"),
+                InlineKeyboardButton(plus_label, callback_data=f"vcf:{ctrl.key}:1"),
+            ])
+        tail = [InlineKeyboardButton("Reset safe baseline", callback_data="vcr")]
+        if workspace and workspace.get("selected_source_candidate"):
+            tail.append(InlineKeyboardButton("Promote inactive profile", callback_data="vcp"))
+        rows.append(tail)
+        return InlineKeyboardMarkup(rows)
+
+    async def send_voice_clone_panel(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        workspace: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send interactive voice-clone controls/audition workspace."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            if workspace is None:
+                from tools.voice_clone_workspace import create_effect_draft_workspace
+
+                workspace = create_effect_draft_workspace(f"{self.name}:{chat_id}")
+            from tools.voice_clone_workspace import render_workspace_text
+
+            panel_text = render_workspace_text(workspace)
+            for sample in workspace.get("samples", []):
+                if sample.get("ok") and sample.get("path"):
+                    await self.send_voice(chat_id, str(sample.get("path")), metadata=metadata)
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=_html.escape(panel_text),
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._voice_clone_keyboard(workspace),
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(),
+            )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_voice_clone_panel failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -7118,6 +7192,92 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Voice-clone callbacks (short callback_data; recover workspace from chat) ---
+        if data.startswith(("vcs:", "vcc:", "vcf:", "vcr", "vcp")):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to use voice-clone controls.")
+                return
+            try:
+                from tools.voice_clone_workspace import (
+                    apply_effect_delta,
+                    latest_workspace_for_chat,
+                    promote_workspace,
+                    render_workspace_text,
+                    reset_workspace_effects,
+                    select_candidate,
+                    select_source_candidate,
+                )
+                ws = latest_workspace_for_chat(str(query_chat_id or ""))
+                text = ""
+                keyboard = None
+                if data.startswith("vcs:"):
+                    if not ws:
+                        await query.answer(text="No voice-clone workspace found.")
+                        return
+                    idx = int(data.split(":", 1)[1])
+                    ws = select_source_candidate(str(ws["id"]), idx)
+                    text = _html.escape(render_workspace_text(ws))
+                    keyboard = self._voice_clone_keyboard(ws)
+                    await query.answer(text=f"Source {idx} selected")
+                elif data.startswith("vcc:"):
+                    if not ws:
+                        await query.answer(text="No voice-clone workspace found.")
+                        return
+                    idx = int(data.split(":", 1)[1])
+                    ws = select_candidate(str(ws["id"]), idx)
+                    text = _html.escape(render_workspace_text(ws))
+                    keyboard = self._voice_clone_keyboard(ws)
+                    await query.answer(text=f"Sample {idx} selection updated")
+                elif data.startswith("vcf:"):
+                    if not ws:
+                        await query.answer(text="This voice-clone panel no longer has an inactive workspace. Open /voiceclone again.")
+                        return
+                    parts = data.split(":", 2)
+                    if len(parts) != 3:
+                        await query.answer(text="Invalid effect control.")
+                        return
+                    control, delta_s = parts[1], parts[2]
+                    result = apply_effect_delta(str(ws["id"]), control, int(delta_s))
+                    ws = result["workspace"]
+                    text = _html.escape(render_workspace_text(ws))
+                    keyboard = self._voice_clone_keyboard(ws)
+                    await query.answer(text=f"{control}: {result['before']} → {result['after']}")
+                elif data == "vcr":
+                    if not ws:
+                        await query.answer(text="This voice-clone panel no longer has an inactive workspace. Open /voiceclone again.")
+                        return
+                    ws = reset_workspace_effects(str(ws["id"]))
+                    text = _html.escape(render_workspace_text(ws))
+                    keyboard = self._voice_clone_keyboard(ws)
+                    await query.answer(text="Reset voice effects")
+                elif data == "vcp":
+                    if not ws:
+                        await query.answer(text="No voice-clone workspace found.")
+                        return
+                    result = promote_workspace(str(ws["id"]))
+                    ws = result["workspace"]
+                    text = _html.escape(render_workspace_text(ws))
+                    keyboard = self._voice_clone_keyboard(ws)
+                    await query.answer(text="Promoted inactive profile; config unchanged")
+                if text:
+                    await query.edit_message_text(
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard,
+                        **self._link_preview_kwargs(),
+                    )
+            except Exception as exc:
+                logger.warning("[%s] voice clone callback failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text=f"Could not update voice clone panel: {exc}")
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
