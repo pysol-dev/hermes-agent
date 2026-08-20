@@ -14,7 +14,7 @@ If you have a paid [Nous Portal](https://portal.nousresearch.com) subscription, 
 
 ## Text-to-Speech
 
-Convert text to speech with ten providers:
+Convert text to speech with eleven providers:
 
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------|
@@ -25,6 +25,7 @@ Convert text to speech with ten providers:
 | **Mistral (Voxtral TTS)** | Excellent | Paid | `MISTRAL_API_KEY` |
 | **Google Gemini TTS** | Excellent | Free tier | `GEMINI_API_KEY` |
 | **xAI TTS** | Excellent | Paid | `XAI_API_KEY` |
+| **Local HTTP** | Depends on sidecar | Free (local) | Optional bearer token |
 | **NeuTTS** | Good | Free (local) | None needed |
 | **KittenTTS** | Good | Free (local) | None needed |
 | **Piper** | Good | Free (local) | None needed |
@@ -43,7 +44,7 @@ Convert text to speech with ten providers:
 ```yaml
 # In ~/.hermes/config.yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "neutts" | "kittentts" | "piper"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "local_http" | "neutts" | "kittentts" | "piper"
   speed: 1.0                    # Global speed multiplier (provider-specific settings override this)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
@@ -76,6 +77,13 @@ tts:
     sample_rate: 24000          # 22050 / 24000 (default) / 44100 / 48000
     bit_rate: 128000            # MP3 bitrate; only applies when codec=mp3
     # base_url: "https://api.x.ai/v1"   # Override via XAI_BASE_URL env var
+  local_http:
+    base_url: "http://127.0.0.1:8020/v1"  # POST <base_url>/audio/speech
+    endpoint: ""                # Optional full URL override
+    model: "xtts-v2"
+    voice: "default"
+    timeout: 120
+    extra_body: {}               # e.g. speaker_wav, effects, effect_preset
   neutts:
     ref_audio: ''
     ref_text: ''
@@ -140,6 +148,7 @@ Each provider has a documented per-request input-character cap. Hermes truncates
 | MiniMax | 10000 |
 | Mistral | 4000 |
 | Google Gemini | 32000 |
+| Local HTTP | 5000 |
 | ElevenLabs | Model-aware (see below) |
 | NeuTTS | 2000 |
 | KittenTTS | 2000 |
@@ -169,7 +178,7 @@ Only positive integers are honored. Zero, negative, non-numeric, or boolean valu
 
 Telegram voice bubbles require Opus/OGG audio format:
 
-- **OpenAI, ElevenLabs, and Mistral** produce Opus natively — no extra setup
+- **OpenAI, ElevenLabs, Mistral, and local_http** can produce Opus natively — no extra setup when the sidecar supports it
 - **Edge TTS** (default) outputs MP3 and needs **ffmpeg** to convert:
 - **MiniMax TTS** outputs MP3 and needs **ffmpeg** to convert for Telegram voice bubbles
 - **Google Gemini TTS** outputs raw PCM and uses **ffmpeg** to encode Opus directly for Telegram voice bubbles
