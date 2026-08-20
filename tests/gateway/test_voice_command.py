@@ -198,9 +198,8 @@ class TestAutoVoiceReply:
     To prevent double audio, _send_voice_reply is skipped when voice input
     already triggered base adapter auto-TTS.
 
-    For Discord voice channels, the base adapter now routes play_tts directly
-    into VC playback, so the runner should still skip voice-input follow-ups to
-    avoid double playback.
+    For Discord voice channels, the runner owns TTS playback and the base
+    adapter's post-handler auto-TTS is disabled for the bound text channel.
     """
 
     @pytest.fixture
@@ -208,7 +207,7 @@ class TestAutoVoiceReply:
         return _make_runner(tmp_path)
 
     def _call(self, runner, voice_mode, message_type, agent_messages=None,
-              response="Hello!", in_voice_channel=False):
+              response="Hello!", in_voice_channel=False, adapter_auto_tts=True):
         """Call real _should_send_voice_reply on a GatewayRunner instance."""
         chat_id = "123"
         if voice_mode != "off":
@@ -218,11 +217,12 @@ class TestAutoVoiceReply:
 
         event = _make_event(message_type=message_type)
 
+        mock_adapter = MagicMock()
+        mock_adapter._should_auto_tts_for_chat = MagicMock(return_value=adapter_auto_tts)
         if in_voice_channel:
-            mock_adapter = MagicMock()
             mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
             event.raw_message = SimpleNamespace(guild_id=111, guild=None)
-            runner.adapters[event.source.platform] = mock_adapter
+        runner.adapters[event.source.platform] = mock_adapter
 
         return runner._should_send_voice_reply(
             event, response, agent_messages or []
@@ -276,10 +276,102 @@ class TestAutoVoiceReply:
 
     # -- Discord VC exception: runner must handle --------------------------
 
-    def test_discord_vc_voice_input_base_handles(self, runner):
-        """Discord VC + voice input: base adapter play_tts plays in VC,
-        so runner skips to avoid double playback."""
-        assert self._call(runner, "all", MessageType.VOICE, in_voice_channel=True) is False
+    def test_discord_vc_voice_input_runner_fires_when_adapter_auto_tts_disabled(self, runner):
+        """Discord VC + voice input: runner plays in VC when base auto-TTS is disabled.
+
+        Voice-channel mode makes the runner own playback: the base adapter can be
+        explicitly opted out for this chat so its post-handler auto-TTS block will
+        not synthesize anything.  The runner must not suppress itself merely
+        because the event originated from STT/VOICE.
+        """
+        from gateway.config import Platform
+
+        chat_id = "123"
+        runner._voice_mode[f"discord:{chat_id}"] = "all"
+        event = MessageEvent(
+            text="hello from VC",
+            message_type=MessageType.VOICE,
+            source=SessionSource(
+                chat_id=chat_id,
+                user_id="user1",
+                platform=Platform.DISCORD,
+            ),
+            raw_message=SimpleNamespace(guild_id=111, guild=None),
+        )
+        adapter = MagicMock()
+        adapter._should_auto_tts_for_chat = MagicMock(return_value=False)
+        runner.adapters[Platform.DISCORD] = adapter
+
+        assert runner._should_send_voice_reply(
+            event, "Hello!", [], already_sent=False
+        ) is True
+        adapter._should_auto_tts_for_chat.assert_called_once_with(chat_id)
+
+    def test_voice_input_runner_skips_when_base_auto_tts_enabled(self, runner):
+        """Voice input still dedups when the base adapter will synthesize it."""
+        from gateway.config import Platform
+
+        chat_id = "123"
+        runner._voice_mode[f"telegram:{chat_id}"] = "all"
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.VOICE,
+            source=SessionSource(
+                chat_id=chat_id,
+                user_id="user1",
+                platform=Platform.TELEGRAM,
+            ),
+        )
+        adapter = MagicMock()
+        adapter._should_auto_tts_for_chat = MagicMock(return_value=True)
+        runner.adapters[Platform.TELEGRAM] = adapter
+
+        assert runner._should_send_voice_reply(
+            event, "Hello!", [], already_sent=False
+        ) is False
+
+    @pytest.mark.asyncio
+    async def test_discord_vc_join_disables_adapter_auto_tts_for_runner_owned_playback(self, runner):
+        """Joining Discord VC keeps /voice all but suppresses base auto-TTS.
+
+        The next VC-originated response must be spoken by runner._send_voice_reply;
+        the base adapter post-handler would otherwise see the same text and race
+        the runner or make both paths skip.
+        """
+        from gateway.config import Platform
+
+        chat_id = "123"
+        guild_id = 111
+        voice_channel = SimpleNamespace(name="General")
+        adapter = MagicMock()
+        adapter.get_user_voice_channel = AsyncMock(return_value=voice_channel)
+        adapter.join_voice_channel = AsyncMock(return_value=True)
+        adapter._voice_text_channels = {}
+        adapter._voice_sources = {}
+        adapter._auto_tts_disabled_chats = set()
+        adapter._auto_tts_enabled_chats = set()
+        adapter._voice_input_callback = None
+        adapter._on_voice_disconnect = None
+        adapter._voice_mode_getter = None
+        runner.adapters[Platform.DISCORD] = adapter
+        runner._get_guild_id = lambda _event: guild_id
+        event = MessageEvent(
+            text="/voice channel",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                chat_id=chat_id,
+                user_id="user1",
+                platform=Platform.DISCORD,
+            ),
+        )
+
+        result = await runner._handle_voice_channel_join(event)
+
+        assert "Joined voice channel" in result
+        assert runner._voice_mode[f"discord:{chat_id}"] == "all"
+        assert adapter._auto_tts_disabled_chats == {chat_id}
+        assert adapter._auto_tts_enabled_chats == set()
+        assert adapter._voice_text_channels[guild_id] == int(chat_id)
 
 
     # -- Edge cases --------------------------------------------------------
@@ -1773,6 +1865,10 @@ class TestVoiceTTSPlayback:
         """Streaming OFF + voice input: runner skips — base adapter handles."""
         from gateway.platforms.base import MessageType
         runner = self._make_runner()
+        from gateway.config import Platform
+        adapter = MagicMock()
+        adapter._should_auto_tts_for_chat = MagicMock(return_value=True)
+        runner.adapters[Platform.DISCORD] = adapter
         assert self._call_should_reply(runner, "all", MessageType.VOICE, already_sent=False) is False
 
     def test_text_input_voice_all_runner_fires(self):

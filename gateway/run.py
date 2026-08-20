@@ -19804,7 +19804,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter._voice_sources[guild_id] = event.source.to_dict()
             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
-            self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+            # Discord VC playback is runner-owned.  If the base adapter's
+            # post-handler auto-TTS is also enabled for this chat, both paths
+            # suppress each other or double-play depending on turn timing.
+            self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
             return (
                 f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
@@ -20032,12 +20035,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if has_agent_tts:
             return False
 
-        # Dedup: base adapter auto-TTS already handles voice input
-        # (play_tts plays in VC when connected, so runner can skip).
-        # When streaming already delivered the text (already_sent=True),
-        # the base adapter will receive None and can't run auto-TTS,
-        # so the runner must take over.
-        if is_voice_input and not already_sent:
+        # Dedup: base adapter auto-TTS already handles voice input only when it
+        # is actually enabled for this chat. Discord VC mode deliberately
+        # disables the base adapter path while leaving runner playback enabled;
+        # in that case _send_voice_reply() owns synthesis and VC playback.
+        if is_voice_input and not already_sent and adapter_auto_tts:
             return False
 
         return True
