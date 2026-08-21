@@ -22067,6 +22067,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
                 self._voice_key(Platform.DISCORD, str(chat_id)), "off"
             )
+        if hasattr(adapter, "_voice_busy_getter"):
+            adapter._voice_busy_getter = self._is_discord_voice_chat_busy
 
         try:
             success = await adapter.join_voice_channel(voice_channel)
@@ -22131,6 +22133,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._save_voice_modes()
         adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+
+    def _is_discord_voice_chat_busy(self, chat_id: str) -> bool:
+        """Return whether a linked Discord text chat has a live agent turn.
+
+        Session keys deliberately preserve ``platform`` and ``chat_id`` at
+        positions 2 and 4 across the main and named-profile namespaces. A VC
+        should stay joined while any turn for its linked text chat is active;
+        the adapter defers and re-arms the idle timer when this returns true.
+        """
+        target = str(chat_id)
+        for session_key in self._running_agents:
+            parts = str(session_key).split(":")
+            if len(parts) >= 5 and parts[2] == Platform.DISCORD.value and parts[4] == target:
+                return True
+        return False
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for the same recent utterance.

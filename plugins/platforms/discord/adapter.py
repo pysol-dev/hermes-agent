@@ -1058,7 +1058,8 @@ class DiscordAdapter(BasePlatformAdapter):
     MAX_SPLIT_MESSAGES = 8
 
     # Auto-disconnect from voice channel after this many seconds of inactivity.
-    # Config key: discord.voice_channel_inactivity_timeout_seconds (0 disables)
+    # Preferred config: discord.voice_timeout.timeout_seconds (0 disables).
+    # The legacy flat key remains supported for existing installations.
     VOICE_TIMEOUT = 300
     # Minimum seconds to wait for a single voice playback. The effective limit
     # scales with the probed clip duration so long readbacks are not cut off at
@@ -1095,7 +1096,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
         self._voice_sources: Dict[int, Dict[str, Any]] = {}  # guild_id -> linked text channel source metadata
         self._voice_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout task
-        self._voice_timeout_seconds = self._load_voice_timeout()
+        (
+            self._voice_timeout_seconds,
+            self._voice_disconnect_while_busy,
+        ) = self._load_voice_timeout_config()
         self._playback_timeout_seconds = self._load_playback_timeout()
         # Phase 2: voice listening
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
@@ -1107,6 +1111,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # the bot in the channel when the user deliberately picked text-only
         # (/voice off) instead of leaving (/voice leave).
         self._voice_mode_getter: Optional[Callable] = None  # set by run.py
+        # Resolves whether the linked text channel currently has an active
+        # agent task. When configured to stay while busy, the timeout is
+        # deferred rather than dropping a live diagnostic or long-running turn.
+        self._voice_busy_getter: Optional[Callable] = None  # set by run.py
         # Phase 3: continuous voice mixer (ambient idle bed + ducked speech).
         # Installed once per guild on join; lets acks / TTS / the "thinking"
         # loop overlap in one outgoing stream instead of stop-and-swap.
@@ -4347,13 +4355,34 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord.%s config: %s", key, e)
             return default
 
-    def _load_voice_timeout(self) -> int:
-        """Return voice-channel inactivity timeout seconds; 0 disables it."""
-        return self._load_discord_int_config(
-            "voice_channel_inactivity_timeout_seconds",
-            self.VOICE_TIMEOUT,
-            minimum=0,
-        )
+    def _load_voice_timeout_config(self) -> Tuple[int, bool]:
+        """Return ``(timeout_seconds, disconnect_while_busy)`` for Discord VC.
+
+        ``discord.voice_timeout`` is the supported schema. Keep the historical
+        flat timeout key as a fallback so upgrades do not silently change
+        existing installations; its old behavior was to disconnect even while
+        busy.
+        """
+        try:
+            from hermes_cli.config import read_raw_config
+
+            discord_cfg = (read_raw_config() or {}).get("discord") or {}
+            legacy_timeout = discord_cfg.get(
+                "voice_channel_inactivity_timeout_seconds", self.VOICE_TIMEOUT
+            )
+            voice_timeout = discord_cfg.get("voice_timeout") or {}
+            if not isinstance(voice_timeout, dict):
+                voice_timeout = {}
+            timeout = max(0, int(voice_timeout.get("timeout_seconds", legacy_timeout)))
+            raw_busy = voice_timeout.get("disconnect_while_busy", True)
+            if isinstance(raw_busy, str):
+                disconnect_while_busy = raw_busy.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                disconnect_while_busy = bool(raw_busy)
+            return timeout, disconnect_while_busy
+        except Exception as e:
+            logger.debug("Could not load discord.voice_timeout config: %s", e)
+            return self.VOICE_TIMEOUT, True
 
     def _load_playback_timeout(self) -> int:
         """Return minimum playback wait seconds for Discord VC audio."""
@@ -4792,6 +4821,22 @@ class DiscordAdapter(BasePlatformAdapter):
                     return
             except Exception:
                 pass
+        busy_getter = getattr(self, "_voice_busy_getter", None)
+        if (
+            not getattr(self, "_voice_disconnect_while_busy", True)
+            and text_ch_id is not None
+            and busy_getter is not None
+        ):
+            try:
+                if busy_getter(str(text_ch_id)):
+                    logger.info(
+                        "Deferring Discord VC inactivity timeout while linked task is active "
+                        "(guild=%d chat=%s)", guild_id, text_ch_id,
+                    )
+                    self._reset_voice_timeout(guild_id)
+                    return
+            except Exception:
+                logger.debug("Could not determine Discord VC busy state", exc_info=True)
         await self.leave_voice_channel(guild_id)
         # Notify the runner so it can clean up voice_mode state
         if self._on_voice_disconnect and text_ch_id:
