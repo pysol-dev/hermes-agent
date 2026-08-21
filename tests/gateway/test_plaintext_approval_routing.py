@@ -92,25 +92,42 @@ def _register_blocking_approval(runner):
     return session_key, entry
 
 
-@pytest.mark.parametrize("reply", ["yes", "approve", "ok", "y", "confirm"])
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "yes",
+        "approve",
+        "ok",
+        "y",
+        "confirm",
+        "I approve the command.",
+        "Yes, I approve it!",
+        "I approve it",
+        "I just approved it",
+        "I did. I just approved it.",
+    ],
+)
 def test_plaintext_yes_resolves_approval(reply):
     _clear_approval_state()
     runner, adapter = _make_runner()
     session_key, entry = _register_blocking_approval(runner)
 
+    event = _make_event(reply)
     handled = asyncio.run(
-        runner._handle_active_session_busy_message(_make_event(reply), session_key)
+        runner._handle_active_session_busy_message(event, session_key)
     )
 
     assert handled is True
     assert entry.event.is_set()
     assert entry.result == "once"
+    assert event.text == "/approve"
     # The user gets a confirmation reply, not silence.
     adapter._send_with_retry.assert_awaited()
     _clear_approval_state()
 
 
-def test_no_pending_approval_does_not_consume_conversational_yes():
+@pytest.mark.parametrize("reply", ["yes", "I approve it", "I did. I just approved it."])
+def test_no_pending_approval_does_not_consume_conversational_yes(reply):
     """A bare 'yes' with NO blocking approval must NOT be treated as an
     approval — it falls through to normal busy handling (design intent:
     'yes' in conversation must not execute a dangerous command)."""
@@ -120,16 +137,45 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
     session_key = runner._session_key_for_source(source)
     # No approval registered.
 
+    event = _make_event(reply)
+    approve_handler = AsyncMock()
+    deny_handler = AsyncMock()
+    runner._handle_approve_command = approve_handler
+    runner._handle_deny_command = deny_handler
     handled = asyncio.run(
-        runner._handle_active_session_busy_message(_make_event("yes"), session_key)
+        runner._handle_active_session_busy_message(event, session_key)
     )
 
-    # No approval existed, so nothing was resolved — the "yes" is treated
-    # as ordinary text, not as a dangerous-command approval (design intent).
-    # (It still flows through normal busy handling, which may send a busy
-    # ack; the contract here is only that no approval was consumed.)
+    # No approval existed, so nothing was resolved — the reply stays ordinary
+    # text and must not be synthesized into /approve or /deny.
     from tools.approval import _gateway_queues
     assert session_key not in _gateway_queues
+    assert event.text == reply
+    approve_handler.assert_not_awaited()
+    deny_handler.assert_not_awaited()
+    assert handled is not None
     _clear_approval_state()
 
 
+@pytest.mark.parametrize(
+    "reply",
+    ["I approve the command now", "I do not approve the command"],
+)
+def test_pending_approval_does_not_consume_nonexact_text(reply):
+    """The natural-language fallback is a closed exact-phrase allowlist."""
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    session_key, entry = _register_blocking_approval(runner)
+    event = _make_event(reply)
+    approve_handler = AsyncMock()
+    deny_handler = AsyncMock()
+    runner._handle_approve_command = approve_handler
+    runner._handle_deny_command = deny_handler
+
+    asyncio.run(runner._handle_active_session_busy_message(event, session_key))
+
+    assert not entry.event.is_set()
+    assert event.text == reply
+    approve_handler.assert_not_awaited()
+    deny_handler.assert_not_awaited()
+    _clear_approval_state()

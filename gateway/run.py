@@ -10267,11 +10267,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from tools.approval import has_blocking_approval
             if event.allow_gateway_control and has_blocking_approval(session_key):
                 _raw_text = (event.text or "").strip().lower()
-                _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
+                # Discord and text-chat users naturally include sentence
+                # punctuation ("Yes, I approve it!" / "I did. I just approved
+                # it."). Normalize only that punctuation, then match a closed
+                # list of affirmative phrases. This remains inside the live
+                # approval gate above, so ordinary chat cannot authorize work.
+                _approval_text = " ".join(
+                    _raw_text.replace(".", " ").replace(",", " ").replace("!", " ").split()
+                )
+                _approve_words = {
+                    "approve",
+                    "yes",
+                    "ok",
+                    "okay",
+                    "confirm",
+                    "y",
+                    "👍",
+                    "i approve the command",
+                    "yes i approve it",
+                    "i approve it",
+                    "i just approved it",
+                    "i did i just approved it",
+                }
                 _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
                 _approval_handler = None
                 _normalized_args = ""
-                if _raw_text in _approve_words:
+                if _approval_text in _approve_words:
                     _approval_handler = self._handle_approve_command
                 elif _raw_text in _deny_words:
                     _approval_handler = self._handle_deny_command
@@ -10288,7 +10309,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # MessageEvent.is_command()/get_command_args() only
                     # recognize the "/" prefix, not the per-platform display
                     # prefix ("!" on Slack/Matrix).
-                    _verb = "approve" if _approval_handler is self._handle_approve_command else "deny"
+                    _verb = "approve" if _approval_handler == self._handle_approve_command else "deny"
                     _synth = f"/{_verb}"
                     if _normalized_args:
                         _synth = f"{_synth} {_normalized_args}"
