@@ -979,6 +979,36 @@ class TestDiscordVoiceChannelMethods:
         assert adapter._voice_timeout_seconds == 0
         assert adapter._playback_timeout_seconds == 240
 
+    def test_discord_nested_voice_timeout_config_loaded(self):
+        """The supported nested Discord VC timeout config wins over legacy keys."""
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        from gateway.config import PlatformConfig
+
+        with patch("hermes_cli.config.read_raw_config", return_value={
+            "discord": {
+                "voice_channel_inactivity_timeout_seconds": 300,
+                "voice_timeout": {
+                    "timeout_seconds": 1200,
+                    "disconnect_while_busy": False,
+                },
+            }
+        }):
+            adapter = DiscordAdapter(PlatformConfig(enabled=True, token="x"))
+
+        assert adapter._voice_timeout_seconds == 1200
+        assert adapter._voice_disconnect_while_busy is False
+
+    def test_runner_detects_active_task_for_linked_discord_voice_chat(self):
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._running_agents["agent:main:discord:group:999:42"] = object()
+        runner._running_agents["agent:coder:discord:group:777:42"] = object()
+
+        assert runner._is_discord_voice_chat_busy("999") is True
+        assert runner._is_discord_voice_chat_busy("777") is True
+        assert runner._is_discord_voice_chat_busy("998") is False
+
     @pytest.mark.asyncio
     async def test_playback_timeout_scales_with_audio_duration(self):
         adapter = self._make_adapter()
@@ -1433,6 +1463,25 @@ class TestVoiceTimeoutCleansRunnerState:
 
         assert "999" in callback_calls, \
             "_on_voice_disconnect must be called with chat_id on timeout"
+
+    @pytest.mark.asyncio
+    async def test_timeout_defers_while_linked_voice_task_is_busy(self, adapter):
+        """Auto-leave must not cut off an active task for the linked VC chat."""
+        adapter._voice_timeout_seconds = 300
+        adapter._voice_disconnect_while_busy = False
+        adapter._voice_busy_getter = lambda chat_id: chat_id == "999"
+        adapter._voice_mode_getter = None
+        adapter._voice_text_channels[111] = 999
+        adapter._reset_voice_timeout = MagicMock()
+        adapter.leave_voice_channel = AsyncMock()
+        adapter._on_voice_disconnect = MagicMock()
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await adapter._voice_timeout_handler(111)
+
+        adapter.leave_voice_channel.assert_not_awaited()
+        adapter._on_voice_disconnect.assert_not_called()
+        adapter._reset_voice_timeout.assert_called_once_with(111)
 
 
 # =====================================================================
