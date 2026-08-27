@@ -144,6 +144,11 @@ models-dev-upstream/
 opencode.json
 config/mcporter.json
 
+# ACPX/OMO and CortexKit session continuations are local agent runtime state,
+# not Hermes source edits.  Do not let them block an in-place `hermes update`.
+.omo/
+.cortexkit/
+
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*

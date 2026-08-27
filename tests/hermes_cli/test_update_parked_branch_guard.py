@@ -395,6 +395,45 @@ def test_update_updates_unmerged_branch_in_place_when_configured(
     assert "feature work" in _git(repo_pair, "log", "--oneline").stdout
 
 
+def test_in_place_conflict_aborts_without_moving_or_restarting(
+    repo_pair, monkeypatch, capsys
+):
+    """A maintained branch must survive an upstream overlap intact.
+
+    ``hermes update`` may not leave a merge in progress, move the checkout to
+    main, or continue to its dependency/restart tail after this conflict.
+    """
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"updates": {"parked_branch_strategy": "update_in_place"}},
+    )
+    # origin/main changed a.txt from "one" to "two"; change that same line on
+    # the maintained branch to force a real three-way merge conflict.
+    (repo_pair / "a.txt").write_text("custom branch version\n")
+    _git(repo_pair, "add", "a.txt")
+    _git(repo_pair, "commit", "-qm", "custom overlapping change")
+    tip_before = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    _patch_update_flow(monkeypatch, repo_pair)
+
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "Merge conflict between local commits and upstream" in out
+    assert "nothing was changed" in out
+    assert "✓ Code updated!" not in out
+    assert "✓ Update complete!" not in out
+    assert _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "old-feature"
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout.strip() == tip_before
+    assert (repo_pair / "a.txt").read_text() == "custom branch version\n"
+    assert _git(repo_pair, "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode != 0
+
+
 def test_switch_branch_flag_overrides_in_place_strategy(
     repo_pair, monkeypatch, capsys
 ):
