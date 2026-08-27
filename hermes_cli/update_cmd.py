@@ -2230,6 +2230,57 @@ def _restore_stashed_changes(
     print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
     return True
 
+
+def _push_in_place_branch_or_rollback(
+    git_cmd: list[str], cwd: Path, branch: str, rollback_sha: str | None
+) -> bool:
+    """Push an in-place-updated custom branch, reverting it if the push fails."""
+    tracking = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    tracked = tracking.stdout.strip()
+    if tracking.returncode != 0 or "/" not in tracked:
+        print(f"✗ Updated '{branch}' locally, but it has no pushable tracking branch.")
+        return False
+    remote, remote_branch = tracked.split("/", 1)
+    if remote == "origin":
+        print(
+            f"✗ Refusing to automatically push '{branch}' to origin/{remote_branch}; "
+            "origin is the official update source."
+        )
+        return False
+
+    push = subprocess.run(
+        git_cmd + ["push", remote, f"HEAD:refs/heads/{remote_branch}"],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if push.returncode == 0:
+        print(f"  ✓ Pushed '{branch}' to {remote}/{remote_branch}.")
+        return True
+
+    if rollback_sha:
+        rollback = subprocess.run(
+            git_cmd + ["reset", "--hard", rollback_sha],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        if rollback.returncode == 0:
+            print(
+                f"✗ Could not push '{branch}' to {remote}/{remote_branch}; "
+                "the local update was rolled back."
+            )
+        else:
+            print(
+                f"✗ Could not push '{branch}' to {remote}/{remote_branch}, "
+                "and automatic rollback failed."
+            )
+    else:
+        print(f"✗ Could not push '{branch}' to {remote}/{remote_branch}.")
+    if push.stderr.strip():
+        print(f"  {push.stderr.strip().splitlines()[0]}")
+    return False
+
+
 def _discard_stashed_changes(
     git_cmd: list[str],
     cwd: Path,
@@ -6612,6 +6663,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print("  Could not capture pre-pull SHA — recover manually with:")
                     print(f"    cd {_m().PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
                 sys.exit(1)
+
+            if in_place_update:
+                try:
+                    from hermes_cli.config import load_config as _load_cfg
+
+                    _update_cfg = (_load_cfg() or {}).get("updates", {})
+                    _push_in_place = bool(
+                        isinstance(_update_cfg, dict)
+                        and _update_cfg.get("push_in_place_branch", False)
+                    )
+                except Exception as exc:
+                    logger.debug("Could not read updates.push_in_place_branch: %s", exc)
+                    _push_in_place = False
+                if _push_in_place and not _push_in_place_branch_or_rollback(
+                    git_cmd, _m().PROJECT_ROOT, current_branch, pre_pull_sha
+                ):
+                    sys.exit(1)
 
             update_succeeded = True
         finally:

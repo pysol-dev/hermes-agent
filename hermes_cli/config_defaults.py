@@ -3379,6 +3379,12 @@ DEFAULT_CONFIG = {
         #                         run (e.g. a deep feature branch that must
         #                         not accumulate update merge commits).
         "parked_branch_strategy": "switch",
+        # When a maintained custom branch is updated in place, push its merge
+        # result to the branch's non-origin tracking remote. If that push is
+        # rejected Hermes restores the local branch to its pre-update commit
+        # and fails before dependency/restart work. Off by default because most
+        # upstream contributors do not want an updater to publish work.
+        "push_in_place_branch": False,
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the
         # upstream installer is not appropriate for the machine, for example

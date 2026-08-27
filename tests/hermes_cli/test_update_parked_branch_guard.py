@@ -434,6 +434,58 @@ def test_in_place_conflict_aborts_without_moving_or_restarting(
     assert _git(repo_pair, "rev-parse", "--verify", "MERGE_HEAD", check=False).returncode != 0
 
 
+def _add_fork_tracking(repo_pair):
+    """Attach the maintained branch to a distinct writable fork remote."""
+    fork = repo_pair.parent / "fork.git"
+    _git(repo_pair.parent, "init", "-q", "--bare", str(fork))
+    _git(repo_pair, "remote", "add", "fork", str(fork))
+    _git(repo_pair, "push", "-qu", "fork", "old-feature")
+    return fork
+
+
+def test_in_place_push_updates_tracked_fork_branch(repo_pair, capsys):
+    """A completed in-place update publishes its maintained branch normally."""
+    fork = _add_fork_tracking(repo_pair)
+    (repo_pair / "feature.txt").write_text("merged upstream plus local work\n")
+    _git(repo_pair, "add", "feature.txt")
+    _git(repo_pair, "commit", "-qm", "in-place update merge")
+    tip = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+
+    assert update_cmd._push_in_place_branch_or_rollback(
+        GIT, repo_pair, "old-feature", None
+    )
+    remote_tip = _git(repo_pair, "ls-remote", str(fork), "refs/heads/old-feature").stdout.split()[0]
+    assert remote_tip == tip
+    assert "Pushed 'old-feature' to fork/old-feature" in capsys.readouterr().out
+
+
+def test_rejected_in_place_push_rolls_back_local_branch(repo_pair, capsys):
+    """A concurrent fork change rejects the push and restores the old local tip."""
+    fork = _add_fork_tracking(repo_pair)
+    pre_update = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+
+    other = repo_pair.parent / "other"
+    _git(repo_pair.parent, "clone", "-q", str(fork), str(other))
+    _git(other, "checkout", "-qb", "old-feature", "origin/old-feature")
+    _git(other, "config", "user.email", "test@example.com")
+    _git(other, "config", "user.name", "Test")
+    (other / "remote.txt").write_text("concurrent fork update\n")
+    _git(other, "add", "remote.txt")
+    _git(other, "commit", "-qm", "fork advances")
+    _git(other, "push", "-q", "origin", "old-feature")
+
+    (repo_pair / "local.txt").write_text("local merged update\n")
+    _git(repo_pair, "add", "local.txt")
+    _git(repo_pair, "commit", "-qm", "local update")
+
+    assert not update_cmd._push_in_place_branch_or_rollback(
+        GIT, repo_pair, "old-feature", pre_update
+    )
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout.strip() == pre_update
+    assert not (repo_pair / "local.txt").exists()
+    assert "the local update was rolled back" in capsys.readouterr().out
+
+
 def test_switch_branch_flag_overrides_in_place_strategy(
     repo_pair, monkeypatch, capsys
 ):
