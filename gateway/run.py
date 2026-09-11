@@ -22454,11 +22454,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
-            for p in ({audio_path, *actual_paths} - {None}):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+            from gateway.audio_retention import finalize_generated_audio
+
+            finalize_generated_audio({audio_path, *actual_paths} - {None})
 
     async def _deliver_media_from_response(
         self,

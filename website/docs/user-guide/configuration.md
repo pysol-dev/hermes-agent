@@ -1762,6 +1762,7 @@ The same gate also enables **result-reference stubbing**: when a re-issued ident
 tts:
   provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "neutts" | "kittentts" | "piper" | "deepinfra"
   speed: 1.0                    # Global speed multiplier (fallback for all providers)
+  generated_audio_retention_hours: 24  # Final gateway-spoken audio; 0 deletes immediately
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
     speed: 1.0                  # Speed multiplier (converted to rate percentage, e.g. 1.5 → +50%)
@@ -1798,6 +1799,14 @@ tts:
 ```
 
 This controls both the `text_to_speech` tool and spoken replies in voice mode (`/voice tts` in the CLI or messaging gateway).
+
+Gateway-generated spoken replies are stored under the active Hermes home in
+`audio/generated/` for 24 hours by default. This retains the exact final audio
+delivered to the platform regardless of TTS provider or engine, which makes
+intermittent synthesis failures auditable. Set
+`tts.generated_audio_retention_hours` to any non-negative number of hours; `0`
+restores immediate deletion after delivery. Expired files are pruned
+opportunistically when new gateway speech is generated.
 
 **Speed fallback hierarchy:** provider-specific speed (e.g. `tts.edge.speed`) → global `tts.speed` → `1.0` default. Set the global `tts.speed` to apply a uniform speed across all providers, or override per-provider for fine-grained control.
 

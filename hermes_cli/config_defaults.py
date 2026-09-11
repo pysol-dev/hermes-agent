@@ -1706,6 +1706,10 @@ DEFAULT_CONFIG = {
         # Set explicitly to pin a backend:
         # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "gemini" | "deepinfra" | "neutts" (local) | "kittentts" (local) | "piper" (local)
         "provider": "edge",
+        # Preserve the final audio artifact delivered by gateway auto-TTS for
+        # diagnostics. Applies to every provider/engine. Set 0 to delete
+        # immediately after delivery, or any non-negative number of hours.
+        "generated_audio_retention_hours": 24,
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
