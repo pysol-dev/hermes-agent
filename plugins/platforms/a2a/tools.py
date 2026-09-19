@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional, TypedDict
 
 from . import protocol, security
+from .external_harness import ExternalHarnessClient, ExternalHarnessError, StdlibA2ATransport
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,165 @@ def _auth_header(auth: dict) -> dict:
     if auth and auth.get("type") == "bearer" and auth.get("token"):
         return {"Authorization": f"Bearer {auth['token']}"}
     return {}
+
+
+def _external_harness_client(args: dict[str, Any]) -> ExternalHarnessClient:
+    peer = _resolve_peer(str(args.get("peer") or args.get("agent") or "").strip())
+    if not peer or not peer.get("url"):
+        raise ExternalHarnessError("CONTRACT_UNSUPPORTED", "a configured strict A2A peer is required")
+    from hermes_constants import get_hermes_home
+
+    database = get_hermes_home() / "a2a_external_harness.sqlite"
+    auth = peer.get("auth", {}) or {}
+    token = str(auth.get("token") or "") if auth.get("type") == "bearer" else ""
+    return ExternalHarnessClient(peer["url"], StdlibA2ATransport(int(peer.get("timeout", _DEFAULT_TIMEOUT))), database, token)
+
+
+def _format_external_error(error: ExternalHarnessError, peer: str = "") -> str:
+    fields = error.as_dict()
+    parts = [f"EXTERNAL HARNESS ERROR [{fields['reasonCode']}]", f"retryable={fields['retryable']}"]
+    if peer:
+        parts.append(f"peer={security.redact_outbound(peer)}")
+    if fields["taskId"]: parts.append(f"task={fields['taskId']}")
+    if fields["contextId"]: parts.append(f"context={fields['contextId']}")
+    if fields["detail"]: parts.append(fields["detail"])
+    return " | ".join(parts)
+
+
+def _format_external_task(task: dict[str, Any]) -> str:
+    status = task.get("status", {}) if isinstance(task.get("status"), dict) else {}
+    state = str(status.get("state") or "UNKNOWN")
+    external = (task.get("metadata") or {}).get("externalHarness", {}) if isinstance(task.get("metadata"), dict) else {}
+    lifecycle = external.get("lifecycle", {}) if isinstance(external, dict) else {}
+    reason = lifecycle.get("reasonCode") or ""
+    retryable = lifecycle.get("retryable")
+    line = f"External harness task {task.get('id', '?')} | context {task.get('contextId', '?')} | {state}"
+    harness = external.get("harness", {}) if isinstance(external, dict) else {}
+    identity = external.get("identity", {}) if isinstance(external, dict) else {}
+    requested = identity.get("requested", {}) if isinstance(identity, dict) else {}
+    requested_model = requested.get("model", {}) if isinstance(requested, dict) else {}
+    effective = identity.get("effective", {}) if isinstance(identity, dict) else {}
+    effective_model = effective.get("model", {}) if isinstance(effective, dict) else {}
+    workspace = external.get("workspace", {}) if isinstance(external, dict) else {}
+    line += (
+        f"\nHarness: {harness.get('kind', '?')}"
+        f" | requested={requested.get('modeId', '?')}@"
+        f"{requested_model.get('providerId', '?')}/{requested_model.get('modelId', '?')}"
+        f" | verification={identity.get('verificationStatus', '?')}"
+    )
+    if effective:
+        line += (
+            f" | effective={effective.get('modeId', '?')}@"
+            f"{effective_model.get('providerId', '?')}/{effective_model.get('modelId', '?')}"
+        )
+    line += (
+        f"\nWorkspace: {workspace.get('id', '?')}"
+        f" | {workspace.get('strategy', '?')}"
+        f" | isolation={workspace.get('isolation', '?')}"
+        f"\nLifecycle: phase={lifecycle.get('phase', '?')}"
+        f" attempt={lifecycle.get('attempt', '?')}"
+    )
+    details: list[str] = []
+    message_text = protocol.extract_text(status.get("message") or {})
+    if message_text:
+        details.append(security.redact_outbound(message_text))
+    for artifact in task.get("artifacts", []) or []:
+        if isinstance(artifact, dict):
+            artifact_text = protocol.extract_text(artifact)
+            if artifact_text:
+                details.append(security.redact_outbound(artifact_text))
+    if state in {"TASK_STATE_FAILED", "TASK_STATE_REJECTED", "TASK_STATE_AUTH_REQUIRED", "TASK_STATE_INPUT_REQUIRED"}:
+        line += f"\nLOUD STATUS: reasonCode={reason or 'UPSTREAM_PROTOCOL_ERROR'} retryable={bool(retryable)}"
+    if details:
+        line += "\n" + "\n".join(details)
+    return line
+
+
+def a2a_external_harness_start(args: dict, **_: Any) -> str:
+    try:
+        with _external_harness_client(args) as client:
+            task = client.start(
+                str(args.get("harness_kind") or ""),
+                str(args.get("mode_id") or ""),
+                str(args.get("provider_id") or ""),
+                str(args.get("model_id") or ""),
+                args.get("workspace") or {},
+                str(args.get("prompt") or ""),
+                str(args.get("idempotency_key") or ""),
+                str(args.get("caller_correlation") or "") or None,
+            )
+        return _format_external_task(task)
+    except ExternalHarnessError as exc:
+        return _format_external_error(exc, str(args.get("peer") or ""))
+
+
+def a2a_external_harness_status(args: dict, **_: Any) -> str:
+    try:
+        with _external_harness_client(args) as client:
+            task = client.get(str(args.get("task_id") or ""))
+        return _format_external_task(task)
+    except ExternalHarnessError as exc:
+        return _format_external_error(exc, str(args.get("peer") or ""))
+
+
+def a2a_external_harness_list(args: dict, **_: Any) -> str:
+    try:
+        with _external_harness_client(args) as client:
+            tasks = client.list(
+                context_id=str(args.get("context_id") or ""),
+                status=str(args.get("status") or ""),
+            )
+        return "\n".join(_format_external_task(task) for task in tasks) or "No external harness tasks."
+    except ExternalHarnessError as exc:
+        return _format_external_error(exc, str(args.get("peer") or ""))
+
+
+def a2a_external_harness_read_or_subscribe(args: dict, **_: Any) -> str:
+    try:
+        with _external_harness_client(args) as client:
+            task_id = str(args.get("task_id") or "")
+            task = client.get(task_id)
+            state = str((task.get("status") or {}).get("state") or "")
+            if state not in {"TASK_STATE_SUBMITTED", "TASK_STATE_WORKING"}:
+                return _format_external_task(task)
+            events = list(client.subscribe(task_id))
+            task = client.get(task_id)
+        suffix = (
+            f"\nReceived {len(events)} ordered event(s)."
+            if events
+            else "\nNo new events."
+        )
+        return _format_external_task(task) + suffix
+    except ExternalHarnessError as exc:
+        return _format_external_error(exc, str(args.get("peer") or ""))
+
+
+def a2a_external_harness_follow_up(args: dict, **_: Any) -> str:
+    try:
+        with _external_harness_client(args) as client:
+            task = client.follow_up(
+                str(args.get("task_id") or ""),
+                str(args.get("context_id") or ""),
+                str(args.get("text") or ""),
+                str(args.get("idempotency_key") or ""),
+                str(args.get("kind") or "steer"),
+                str(args.get("interaction_id") or ""),
+            )
+        return _format_external_task(task)
+    except ExternalHarnessError as exc:
+        return _format_external_error(exc, str(args.get("peer") or ""))
+
+
+def a2a_external_harness_cancel(args: dict, **_: Any) -> str:
+    try:
+        with _external_harness_client(args) as client:
+            task = client.cancel(
+                str(args.get("task_id") or ""),
+                str(args.get("reason") or ""),
+            )
+        return _format_external_task(task)
+    except ExternalHarnessError as exc:
+        return _format_external_error(exc, str(args.get("peer") or ""))
 
 
 # --------------------------------------------------------------------------
@@ -166,18 +326,19 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
     # v1.0: contextId lives inside the Message, not at the params top level.
-    rpc_body = {
+    rpc_params: dict[str, Any] = {
+        "message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx),
+    }
+    rpc_body: dict[str, Any] = {
         "jsonrpc": "2.0",
         "id": protocol.new_task_id(),
         "method": "SendMessage",
-        "params": {
-            "message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx),
-        },
+        "params": rpc_params,
     }
 
     tenant = _interface_tenant(card, peer)
     if tenant:
-        rpc_body["params"]["tenant"] = tenant
+        rpc_params["tenant"] = tenant
 
     security.audit("outbound", agent_label, rpc_body["id"], safe_message)
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
@@ -483,6 +644,12 @@ def a2a_orchestrate(args: dict, **_: Any) -> str:
 _FunctionSchema = TypedDict("_FunctionSchema", {"name": str, "description": str, "parameters": dict[str, Any]}, total=False)
 _ToolSchema = TypedDict("_ToolSchema", {"type": str, "function": _FunctionSchema}, total=False)
 _SCHEMAS: dict[str, _ToolSchema] = {
+    "a2a_external_harness_start": {"type": "function", "function": {"name": "a2a_external_harness_start", "description": "Start a durable, strict external A2A harness task. This is separate from generic A2A peer calls and Hermes internal orchestration.", "parameters": {"type": "object", "properties": {"peer": {"type": "string"}, "harness_kind": {"type": "string"}, "mode_id": {"type": "string"}, "provider_id": {"type": "string"}, "model_id": {"type": "string"}, "workspace": {"type": "object"}, "prompt": {"type": "string"}, "idempotency_key": {"type": "string"}, "caller_correlation": {"type": "string"}}, "required": ["peer", "harness_kind", "mode_id", "provider_id", "model_id", "workspace", "prompt", "idempotency_key"]}}},
+    "a2a_external_harness_status": {"type": "function", "function": {"name": "a2a_external_harness_status", "description": "Read the authoritative current status of a strict external A2A harness task.", "parameters": {"type": "object", "properties": {"peer": {"type": "string"}, "task_id": {"type": "string"}}, "required": ["peer", "task_id"]}}},
+    "a2a_external_harness_list": {"type": "function", "function": {"name": "a2a_external_harness_list", "description": "List strict external A2A harness tasks from a configured peer.", "parameters": {"type": "object", "properties": {"peer": {"type": "string"}, "context_id": {"type": "string"}, "status": {"type": "string"}}, "required": ["peer"]}}},
+    "a2a_external_harness_read_or_subscribe": {"type": "function", "function": {"name": "a2a_external_harness_read_or_subscribe", "description": "Read an external A2A harness task and subscribe for ordered updates while it remains active.", "parameters": {"type": "object", "properties": {"peer": {"type": "string"}, "task_id": {"type": "string"}}, "required": ["peer", "task_id"]}}},
+    "a2a_external_harness_follow_up": {"type": "function", "function": {"name": "a2a_external_harness_follow_up", "description": "Send an idempotent answer or steering follow-up to an active strict external A2A harness task.", "parameters": {"type": "object", "properties": {"peer": {"type": "string"}, "task_id": {"type": "string"}, "context_id": {"type": "string"}, "text": {"type": "string"}, "idempotency_key": {"type": "string"}, "kind": {"type": "string", "enum": ["answer", "steer"]}, "interaction_id": {"type": "string"}}, "required": ["peer", "task_id", "context_id", "text", "idempotency_key"]}}},
+    "a2a_external_harness_cancel": {"type": "function", "function": {"name": "a2a_external_harness_cancel", "description": "Cancel a strict external A2A harness task and return its authoritative terminal outcome.", "parameters": {"type": "object", "properties": {"peer": {"type": "string"}, "task_id": {"type": "string"}, "reason": {"type": "string"}}, "required": ["peer", "task_id"]}}},
     "a2a_discover": {
         "type": "function",
         "function": {
@@ -574,6 +741,12 @@ _SCHEMAS: dict[str, _ToolSchema] = {
 }
 
 _HANDLERS = {
+    "a2a_external_harness_start": a2a_external_harness_start,
+    "a2a_external_harness_status": a2a_external_harness_status,
+    "a2a_external_harness_list": a2a_external_harness_list,
+    "a2a_external_harness_read_or_subscribe": a2a_external_harness_read_or_subscribe,
+    "a2a_external_harness_follow_up": a2a_external_harness_follow_up,
+    "a2a_external_harness_cancel": a2a_external_harness_cancel,
     "a2a_discover": a2a_discover,
     "a2a_call": a2a_call,
     "a2a_list": a2a_list,

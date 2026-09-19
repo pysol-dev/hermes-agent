@@ -51,6 +51,30 @@ With the `a2a` toolset enabled, the agent gets:
 | `a2a_history(context_id)` | Recall a persisted A2A conversation |
 | `a2a_orchestrate(capability, message, mode?)` | Fan a task out to every peer advertising a capability (`all` / `first` / `best`) |
 
+Strict external harnesses (OpenCode/OMO, Codex, Claude, and conforming remote
+agents) use a separate durable surface. These calls require a configured bearer
+token, A2A 1.0, the `external-harness:v1` extension, exact mode/model identity,
+and an adapter that advertises hard workspace isolation. They never fall back to
+ACPX or Hermes's internal child/Kanban orchestration.
+
+| Tool | What it does |
+|---|---|
+| `a2a_external_harness_start` | Preflight and durably submit an identity/workspace-bound task |
+| `a2a_external_harness_status` | Refresh the authoritative remote task state |
+| `a2a_external_harness_list` | List durable tasks from one strict peer |
+| `a2a_external_harness_read_or_subscribe` | Read status and consume ordered, resumable SSE events |
+| `a2a_external_harness_follow_up` | Idempotently answer or steer an active task |
+| `a2a_external_harness_cancel` | Request cancellation and return the authoritative outcome |
+
+Strict task output always includes the task/context IDs, lifecycle phase and
+attempt, requested/effective mode and model, identity-verification status, and
+the opaque workspace ID/strategy. Failures are rendered as `EXTERNAL HARNESS
+ERROR` or `LOUD STATUS` with peer, reason code, and retryability instead of
+being presented as a successful reply. Hermes stores request correlation,
+task snapshots, and replay cursors in the profile-scoped
+`a2a_external_harness.sqlite` database so retries and reconnects survive a
+client restart.
+
 Configure known peers in `config.yaml`:
 
 ```yaml
