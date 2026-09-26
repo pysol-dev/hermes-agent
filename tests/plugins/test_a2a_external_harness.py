@@ -175,6 +175,14 @@ def task(
     }
     if identity["verificationStatus"] == "verified":
         identity["effective"] = requested
+        identity["proof"] = {
+            "controlPlane": "verified",
+            "dataPlane": "verified",
+            "challengeId": "01J00000000000000000000002",
+            "evidenceSha256": "a" * 64,
+            "verifiedAt": "2026-09-04T10:00:00.000Z",
+            "verifierVersion": "1",
+        }
     return {
         "id": task_id,
         "contextId": context_id,
@@ -188,6 +196,8 @@ def task(
                     "id": WORKSPACE_ID,
                     "strategy": "scratch",
                     "isolation": "hard",
+                    "leaseId": "lease-1",
+                    "revision": None,
                 },
                 "lifecycle": {
                     "phase": phases[state],
@@ -241,9 +251,9 @@ def sse_snapshot(request_id, snapshot):
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def client(tmp_path, transport, token="test-token"):
+def client(tmp_path, transport, token="test-token", principal="test-principal"):
     return ExternalHarnessClient(
-        "https://peer", transport, tmp_path / "runs.sqlite", token=token
+        "https://peer", transport, tmp_path / "runs.sqlite", token=token, principal=principal
     )
 
 
@@ -709,6 +719,45 @@ def test_task_snapshots_require_full_external_harness_metadata(tmp_path):
     assert "metadata" in exc.value.detail
 
 
+@pytest.mark.parametrize(
+    "state", ["TASK_STATE_WORKING", "TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"])
+@pytest.mark.parametrize("missing", ["proof", "controlPlane", "dataPlane", "evidenceSha256"])
+def test_active_tasks_require_complete_two_source_identity_proof(tmp_path, state, missing):
+    snapshot = task(state=state)
+    identity = snapshot["metadata"]["externalHarness"]["identity"]
+    if missing == "proof":
+        identity.pop("proof")
+    else:
+        identity["proof"].pop(missing)
+    transport = FakeTransport()
+    transport.responses = [{"result": snapshot}]
+    harness = client(tmp_path, transport)
+    harness.rpc_url = "https://peer/rpc"
+
+    with pytest.raises(ExternalHarnessError, match="two-source"):
+        harness.get("task-1")
+
+
+def test_task_snapshots_require_workspace_lease_and_reason_matrix(tmp_path):
+    snapshot = task(state="TASK_STATE_FAILED")
+    snapshot["metadata"]["externalHarness"]["workspace"].pop("leaseId")
+    transport = FakeTransport()
+    transport.responses = [{"result": snapshot}]
+    harness = client(tmp_path, transport)
+    harness.rpc_url = "https://peer/rpc"
+    with pytest.raises(ExternalHarnessError, match="workspace"):
+        harness.get("task-1")
+
+    snapshot = task(state="TASK_STATE_FAILED")
+    snapshot["metadata"]["externalHarness"]["lifecycle"]["retryable"] = False
+    transport = FakeTransport()
+    transport.responses = [{"result": snapshot}]
+    harness = client(tmp_path, transport)
+    harness.rpc_url = "https://peer/rpc"
+    with pytest.raises(ExternalHarnessError, match="lifecycle reason"):
+        harness.get("task-1")
+
+
 def test_start_rejects_changed_identity_binding(tmp_path):
     transport = FakeTransport()
     mismatched = task()
@@ -719,6 +768,33 @@ def test_start_rejects_changed_identity_binding(tmp_path):
 
     with pytest.raises(ExternalHarnessError) as exc:
         client(tmp_path, transport).start(**start_request())
+
+    assert exc.value.reason_code == "CONTEXT_BINDING_MISMATCH"
+
+
+def test_start_rejects_workspace_resolved_at_a_different_revision(tmp_path):
+    request = start_request()
+    request["workspace"] = {
+        "id": WORKSPACE_ID,
+        "strategy": "git-worktree",
+        "isolation": "hard",
+        "rootUri": "file:///tmp/repo",
+        "baseRevision": "0123456789abcdef",
+    }
+    mismatched = task()
+    mismatched["metadata"]["externalHarness"]["workspace"] = {
+        "id": WORKSPACE_ID,
+        "strategy": "git-worktree",
+        "isolation": "hard",
+        "rootUri": "file:///tmp/repo",
+        "leaseId": "lease-1",
+        "revision": "fedcba9876543210",
+    }
+    transport = FakeTransport()
+    transport.responses = [{"result": {"task": mismatched}}]
+
+    with pytest.raises(ExternalHarnessError) as exc:
+        client(tmp_path, transport).start(**request)
 
     assert exc.value.reason_code == "CONTEXT_BINDING_MISMATCH"
 
@@ -919,17 +995,29 @@ def test_card_allows_additive_extension_params_but_requires_declared_bearer(tmp_
         client(tmp_path, transport).start(**request)
 
 
-def test_local_idempotency_cache_is_scoped_to_authenticated_principal(tmp_path):
+def test_token_rotation_preserves_idempotency_for_the_same_principal(tmp_path):
     first_transport = FakeTransport()
     first_transport.responses = [{"result": {"task": task()}}]
-    assert client(tmp_path, first_transport, token="principal-one").start(
+    assert client(tmp_path, first_transport, token="token-one", principal="principal-one").start(
         **start_request()
     ) == task()
 
     second_transport = FakeTransport()
+    assert client(tmp_path, second_transport, token="token-two", principal="principal-one").start(
+        **start_request()
+    ) == task()
+    assert second_transport.calls == []
+
+
+def test_local_idempotency_cache_is_scoped_to_authenticated_principal(tmp_path):
+    first_transport = FakeTransport()
+    first_transport.responses = [{"result": {"task": task()}}]
+    assert client(tmp_path, first_transport, principal="principal-one").start(**start_request()) == task()
+
+    second_transport = FakeTransport()
     second_task = task(task_id="task-2", context_id="ctx-2")
     second_transport.responses = [{"result": {"task": second_task}}]
-    assert client(tmp_path, second_transport, token="principal-two").start(
+    assert client(tmp_path, second_transport, principal="principal-two").start(
         **start_request()
     ) == second_task
     assert any(
@@ -1007,6 +1095,7 @@ def test_live_strict_http_start_status_and_stream_round_trip(tmp_path):
             StdlibA2ATransport(timeout=5),
             tmp_path / "live.sqlite",
             token="test-token",
+            principal="test-principal",
         ) as harness:
             assert harness.start(**start_request())["status"]["state"] == (
                 "TASK_STATE_SUBMITTED"

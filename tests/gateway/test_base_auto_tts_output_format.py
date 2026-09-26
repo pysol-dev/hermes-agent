@@ -12,6 +12,8 @@ voice bubble). The fix passes an explicit output path from
 
 import asyncio
 import json
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -19,11 +21,10 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
-    MessageEvent,
-    MessageType,
     SendResult,
     build_auto_tts_output_path,
 )
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
 from tools.tts_tool import OPUS_VOICE_PLATFORMS
 
@@ -116,6 +117,28 @@ async def _run_auto_tts(adapter: _DummyAdapter, platform: Platform):
 
 
 @pytest.mark.asyncio
+async def test_base_auto_tts_uses_routed_profile_home_and_restores_outer_scope(tmp_path):
+    from gateway.run import _profile_runtime_scope
+    from hermes_constants import get_hermes_home
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    adapter = _DummyAdapter(Platform.TELEGRAM)
+    adapter.gateway_runner = SimpleNamespace(  # type: ignore[assignment]
+        _media_delivery_scope_for_source=lambda _source: _profile_runtime_scope(
+            profile_b, {}, hydrate_secrets=False))
+
+    with _profile_runtime_scope(profile_a, {}, hydrate_secrets=False):
+        requested, _adapter = await _run_auto_tts(adapter, Platform.TELEGRAM)
+        assert str(get_hermes_home()) == str(profile_a)
+
+    assert len(requested) == 1
+    assert Path(requested[0]).is_relative_to(profile_b)
+
+
+@pytest.mark.asyncio
 async def test_base_auto_tts_skips_playback_when_tool_reports_failure():
     """A success=False tool result must not deliver a stale/partial file."""
     adapter = _DummyAdapter(Platform.TELEGRAM)
@@ -141,3 +164,22 @@ async def test_base_auto_tts_skips_playback_when_tool_reports_failure():
     adapter.play_tts.assert_not_awaited()
     # Text reply still goes out.
     assert adapter.sent and adapter.sent[0]["content"] == "reply text"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("retention_hours", "should_exist"), [(24.0, True), (0.0, False)])
+async def test_base_auto_tts_honors_generated_audio_retention(
+    tmp_path, monkeypatch, retention_hours, should_exist,
+):
+    output = tmp_path / "tts_reply_test.mp3"
+    monkeypatch.setattr(
+        "gateway.audio_retention.build_generated_audio_path", lambda _ext: output)
+    monkeypatch.setattr(
+        "gateway.audio_retention.configured_generated_audio_retention_hours",
+        lambda: retention_hours)
+    monkeypatch.setattr("gateway.audio_retention.prune_generated_audio", lambda **_kwargs: 0)
+
+    requested, _adapter = await _run_auto_tts(_DummyAdapter(Platform.DISCORD), Platform.DISCORD)
+
+    assert requested == [str(output)]
+    assert output.exists() is should_exist

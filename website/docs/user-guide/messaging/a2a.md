@@ -75,12 +75,18 @@ task snapshots, and replay cursors in the profile-scoped
 `a2a_external_harness.sqlite` database so retries and reconnects survive a
 client restart.
 
+This is the Hermes client phase of the external-harness contract, not evidence that any
+particular remote adapter has passed the ACPX-replacement acceptance matrix. ACPX cutover requires
+the independent identity, isolation, restart, cancellation, and routing tests in the normative
+contract; installing these tools alone does not satisfy that gate.
+
 Configure known peers in `config.yaml`:
 
 ```yaml
 a2a_agents:
   researcher:
     url: "http://research-box.local:9900"
+    principal: "researcher"  # stable across bearer-token rotation
     auth: { type: bearer, token: "..." }
     timeout: 120
     capabilities: [web_search, research]
@@ -126,7 +132,7 @@ Secure by default; every widening step is explicit:
 | `A2A_ALLOW_ALL_USERS` | `false` | Allow any authenticated peer (dev only) |
 | `A2A_RATE_LIMIT` | `60` | Requests/minute per identity |
 | `A2A_MAX_PINGPONG_TURNS` | `5` | Anti-loop turn cap per context (max 20) |
-| `A2A_REPLY_TIMEOUT` | `300` | Seconds to wait for the agent's reply |
+| `A2A_REPLY_TIMEOUT` | `300` | Seconds to wait for the agent's reply. The orphan-task sweep never fails a task before this window elapses (floor 300s), and never while a request is still waiting on it |
 | `A2A_PUSH_SECRET` | bearer token | HMAC secret for push-notification signing |
 | `A2A_ADVERTISED_TOOLSETS` | all registered | Restrict which skills appear on the Agent Card |
 
@@ -151,4 +157,4 @@ curl -X POST http://your-host:9900/ \
 - **Peers can't reach the card URL** — the card was advertising your bind address; set `A2A_PUBLIC_URL` to the externally routable URL.
 - **`401 Unauthorized`** — token mismatch; check `A2A_PEER_TOKENS`/`A2A_BEARER_TOKEN` on the server and the peer's `auth:` block.
 - **Server won't bind non-localhost** — by design: set a bearer token first, then `A2A_HOST=0.0.0.0`.
-- **Replies time out on long tasks** — raise `A2A_REPLY_TIMEOUT`, or have the caller register a push-notification config and poll `GetTask`.
+- **Replies time out on long tasks** — raise `A2A_REPLY_TIMEOUT` (the orphan sweep follows it, so a late reply is stored, not discarded), or have the caller register a push-notification config and poll `GetTask`.

@@ -146,9 +146,9 @@ async def test_gateway_voice_reply_keeps_exact_delivered_audio(monkeypatch, tmp_
         message_type=MessageType.TEXT,
         message_id="789",
     )
-    monkeypatch.setattr("gateway.run.build_auto_tts_output_path", lambda _platform: str(output))
+    monkeypatch.setattr("gateway.run_voice.build_auto_tts_output_path", lambda _platform: str(output))
     monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", fake_tts)
-    monkeypatch.setattr("tools.tts_tool._strip_markdown_for_tts", lambda text: text)
+    monkeypatch.setattr("tools.tts_text_normalize._strip_markdown_for_tts", lambda text: text)
     monkeypatch.setattr(
         "gateway.audio_retention.configured_generated_audio_retention_hours",
         lambda: 24.0,

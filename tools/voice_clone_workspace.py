@@ -72,7 +72,11 @@ def latest_workspace_for_chat(chat_key: str) -> Dict[str, Any] | None:
         except Exception:
             continue
         stored_key = str(data.get("chat_key") or "")
-        if stored_key == chat_key or (chat_key and f":{chat_key}" in stored_key):
+        parts = stored_key.split(":")
+        same_chat = stored_key == chat_key or (
+            len(parts) >= 5 and parts[0] == "agent" and parts[4] == chat_key
+        )
+        if same_chat:
             if best is None or data.get("created_at", 0) > best.get("created_at", 0):
                 best = data
     return best

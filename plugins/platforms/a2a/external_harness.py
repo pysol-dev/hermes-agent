@@ -312,6 +312,7 @@ class ExternalHarnessClient:
         transport: A2ATransport,
         database: Path | str,
         token: str = "",
+        principal: str = "",
     ) -> None:
         self.peer_url = peer_url.rstrip("/")
         if not self.peer_url.startswith(("http://", "https://")):
@@ -338,11 +339,17 @@ class ExternalHarnessClient:
                 "UPSTREAM_AUTH_REQUIRED",
                 "strict external harness peers require bearer authentication",
             )
+        principal = str(principal or "").strip()
+        if not principal or any(ord(char) < 32 for char in principal):
+            raise ExternalHarnessError(
+                "CONTRACT_UNSUPPORTED",
+                "strict external harness peers require a stable configured principal",
+            )
         self.transport = transport
         self.token = token
         self.storage_scope = (
-            f"{self.peer_url}|bearer-sha256:"
-            f"{hashlib.sha256(token.encode('utf-8')).hexdigest()}"
+            f"{self.peer_url}|principal-sha256:"
+            f"{hashlib.sha256(principal.encode('utf-8')).hexdigest()}"
         )
         database_path = Path(database)
         database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1449,6 +1456,11 @@ class ExternalHarnessClient:
             "model": {"providerId": provider_id, "modelId": model_id},
         }
         actual_workspace = external["workspace"]
+        expected_revision = None
+        if workspace.get("strategy") == "git-worktree":
+            expected_revision = workspace.get("baseRevision")
+        elif workspace.get("strategy") == "remote-managed":
+            expected_revision = (workspace.get("repository") or {}).get("revision")
         if (
             external["harness"]["kind"] != harness_kind
             or external["identity"]["requested"] != expected_identity
@@ -1456,6 +1468,10 @@ class ExternalHarnessClient:
                 actual_workspace.get(key) != workspace.get(key)
                 for key in ("id", "strategy", "isolation")
             )
+            or workspace.get("rootUri") is not None
+            and actual_workspace.get("rootUri") != workspace.get("rootUri")
+            or expected_revision is not None
+            and actual_workspace.get("revision") != expected_revision
         ):
             raise ExternalHarnessError(
                 "CONTEXT_BINDING_MISMATCH",
@@ -1852,12 +1868,30 @@ def _validate_task_metadata(
         or not identity["verificationStatus"]
     ):
         raise _invalid_task_metadata(task, operation, "requested identity")
-    if state in {"TASK_STATE_WORKING", "TASK_STATE_COMPLETED"}:
+    proof_required = state in {
+        "TASK_STATE_WORKING",
+        "TASK_STATE_INPUT_REQUIRED",
+        "TASK_STATE_AUTH_REQUIRED",
+        "TASK_STATE_COMPLETED",
+    }
+    if proof_required:
+        proof = identity.get("proof")
         if (
             identity.get("verificationStatus") != "verified"
             or identity.get("effective") != requested
+            or not isinstance(proof, dict)
+            or proof.get("controlPlane") != "verified"
+            or proof.get("dataPlane") != "verified"
+            or not isinstance(proof.get("challengeId"), str)
+            or not _ULID_RE.fullmatch(proof["challengeId"])
+            or not isinstance(proof.get("evidenceSha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", proof["evidenceSha256"])
+            or not isinstance(proof.get("verifiedAt"), str)
+            or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z", proof["verifiedAt"])
+            or not isinstance(proof.get("verifierVersion"), str)
+            or not proof["verifierVersion"]
         ):
-            raise _invalid_task_metadata(task, operation, "verified effective identity")
+            raise _invalid_task_metadata(task, operation, "two-source verified effective identity")
 
     workspace = external.get("workspace")
     if (
@@ -1867,8 +1901,17 @@ def _validate_task_metadata(
         or workspace.get("strategy")
         not in {"existing", "git-worktree", "scratch", "remote-managed"}
         or workspace.get("isolation") != "hard"
+        or not isinstance(workspace.get("leaseId"), str)
+        or not workspace["leaseId"]
+        or "revision" not in workspace
+        or workspace.get("revision") is not None
+        and not isinstance(workspace.get("revision"), str)
     ):
         raise _invalid_task_metadata(task, operation, "workspace binding")
+    if workspace.get("strategy") in {"git-worktree", "remote-managed"} and not (
+        isinstance(workspace.get("revision"), str) and workspace["revision"]
+    ):
+        raise _invalid_task_metadata(task, operation, "resolved workspace revision")
 
     lifecycle = external.get("lifecycle")
     phase = lifecycle.get("phase") if isinstance(lifecycle, dict) else None
@@ -1893,16 +1936,29 @@ def _validate_task_metadata(
     ):
         raise _invalid_task_metadata(task, operation, "lifecycle")
     reason = lifecycle.get("reasonCode")
-    if state in {
-        "TASK_STATE_FAILED",
-        "TASK_STATE_REJECTED",
-        "TASK_STATE_INPUT_REQUIRED",
-        "TASK_STATE_AUTH_REQUIRED",
-        "TASK_STATE_CANCELED",
-    } and (not isinstance(reason, str) or not reason):
-        raise _invalid_task_metadata(task, operation, "lifecycle reason")
-    if state == "TASK_STATE_CANCELED" and reason != "CANCELED_BY_CALLER":
-        raise _invalid_task_metadata(task, operation, "cancellation reason")
+    reason_contract = {
+        "INPUT_REQUIRED": ("TASK_STATE_INPUT_REQUIRED", False),
+        "AUTH_REQUIRED": ("TASK_STATE_AUTH_REQUIRED", False),
+        "UPSTREAM_AUTH_REQUIRED": ("TASK_STATE_AUTH_REQUIRED", False),
+        **{code: ("TASK_STATE_REJECTED", False) for code in (
+            "MODE_UNAVAILABLE", "MODEL_UNAVAILABLE", "IDENTITY_UNVERIFIED", "IDENTITY_MISMATCH",
+            "WORKSPACE_DENIED", "WORKSPACE_ISOLATION_UNAVAILABLE")},
+        "UPSTREAM_BACKPRESSURE": ("TASK_STATE_REJECTED", True),
+        **{code: ("TASK_STATE_FAILED", False) for code in (
+            "INPUT_EXPIRED", "AUTH_EXPIRED", "UPSTREAM_PROTOCOL_ERROR", "RECOVERY_AMBIGUOUS",
+            "PROCESS_EXIT_NONZERO")},
+        **{code: ("TASK_STATE_FAILED", True) for code in (
+            "UPSTREAM_UNREACHABLE", "RUNTIME_START_FAILED", "RUNTIME_CRASHED", "RUNTIME_LOST",
+            "TIMEOUT", "CANCEL_FAILED", "STREAM_CORRUPT", "STATE_STORE_FAILED")},
+        "CANCELED_BY_CALLER": ("TASK_STATE_CANCELED", False),
+    }
+    terminal_or_waiting = state not in {"TASK_STATE_SUBMITTED", "TASK_STATE_WORKING", "TASK_STATE_COMPLETED"}
+    if terminal_or_waiting:
+        expected = reason_contract.get(reason) if isinstance(reason, str) else None
+        if expected != (state, lifecycle.get("retryable")):
+            raise _invalid_task_metadata(task, operation, "lifecycle reason/state/retryability")
+    elif reason not in {None, ""} or lifecycle.get("retryable") is not False:
+        raise _invalid_task_metadata(task, operation, "successful lifecycle reason/retryability")
 
     stream = external.get("stream")
     latest = stream.get("latestSequence") if isinstance(stream, dict) else None

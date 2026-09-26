@@ -5,26 +5,28 @@ import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import SendResult
-from gateway.run import GatewayRunner, TurnRunner
+from gateway.run import GatewayRunner
+from gateway.run_turn_runner import TurnRunner
 from gateway.session import SessionSource
 from gateway.turn_context import TurnContext
 
 
 def test_discord_approval_notify_path_schedules_telegram_mirror_after_success():
     """Discord button approvals should schedule the Telegram mirror only after send success."""
-    source = inspect.getsource(TurnRunner.run_sync)
-    success_branch = source.split('if _outcome == "sent":', 1)[1].split("return", 1)[0]
+    source = inspect.getsource(TurnRunner._approval_notify_sync)
+    success_branch = source.split('if outcome == "sent":', 1)[1].split("return", 1)[0]
     assert "ctx.source.platform == Platform.DISCORD" in success_branch
     assert "_mirror_discord_approval_to_telegram_home" in success_branch
-    assert "session_key=_approval_session_key" in success_branch
+    assert "session_key=ctx.session_key or" in success_branch
     assert "source_chat_id=ctx.source.chat_id" in success_branch
 
 
 class TelegramApprovalAdapter:
     typed_command_prefix = "/"
 
-    def __init__(self):
+    def __init__(self, config=None):
         self.calls = []
+        self.config = config
 
     async def send_exec_approval(self, **kwargs):
         self.calls.append(kwargs)
@@ -157,21 +159,18 @@ def test_discord_approval_notify_success_path_invokes_mirror(monkeypatch):
 @pytest.mark.asyncio
 async def test_discord_approval_mirror_sends_to_telegram_home_with_same_session_key():
     runner = GatewayRunner.__new__(GatewayRunner)
-    adapter = TelegramApprovalAdapter()
-    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[assignment]
-    runner.config = GatewayConfig(
-        platforms={
-            Platform.TELEGRAM: PlatformConfig(
-                enabled=True,
-                token="***",
-                home_channel=HomeChannel(
-                    platform=Platform.TELEGRAM,
-                    chat_id="5945397802",
-                    name="Home",
-                ),
-            )
-        }
+    telegram_config = PlatformConfig(
+        enabled=True,
+        token="***",
+        home_channel=HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="5945397802",
+            name="Home",
+        ),
     )
+    adapter = TelegramApprovalAdapter(telegram_config)
+    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[assignment]
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: telegram_config})
 
     sent = await runner._mirror_discord_approval_to_telegram_home(
         approval_data={"command": "rm -rf /tmp/example", "description": "test approval"},
@@ -192,9 +191,10 @@ async def test_discord_approval_mirror_sends_to_telegram_home_with_same_session_
 @pytest.mark.asyncio
 async def test_discord_approval_mirror_noops_without_telegram_home():
     runner = GatewayRunner.__new__(GatewayRunner)
-    adapter = TelegramApprovalAdapter()
+    telegram_config = PlatformConfig(enabled=True, token="***")
+    adapter = TelegramApprovalAdapter(telegram_config)
     runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[assignment]
-    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")})
+    runner.config = GatewayConfig(platforms={Platform.TELEGRAM: telegram_config})
 
     sent = await runner._mirror_discord_approval_to_telegram_home(
         approval_data={"command": "ls"},
@@ -204,3 +204,32 @@ async def test_discord_approval_mirror_noops_without_telegram_home():
 
     assert sent is False
     assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_discord_approval_mirror_uses_only_the_session_profiles_telegram_bot():
+    runner = GatewayRunner.__new__(GatewayRunner)
+    default_config = PlatformConfig(
+        enabled=True, token="default",
+        home_channel=HomeChannel(platform=Platform.TELEGRAM, chat_id="default-home", name="Default"),
+    )
+    secondary_config = PlatformConfig(
+        enabled=True, token="secondary",
+        home_channel=HomeChannel(platform=Platform.TELEGRAM, chat_id="secondary-home", name="Secondary"),
+    )
+    default_adapter = TelegramApprovalAdapter(default_config)
+    secondary_adapter = TelegramApprovalAdapter(secondary_config)
+    runner.adapters = {Platform.TELEGRAM: default_adapter}
+    runner._profile_adapters = {"secondary": {Platform.TELEGRAM: secondary_adapter}}
+    runner._primary_profile_name = "default"
+    runner.config = GatewayConfig(multiplex_profiles=True)
+
+    sent = await runner._mirror_discord_approval_to_telegram_home(
+        approval_data={"command": "id"},
+        session_key="agent:secondary:discord:dm:source-chat",
+        source_chat_id="source-chat",
+    )
+
+    assert sent is True
+    assert default_adapter.calls == []
+    assert secondary_adapter.calls[0]["chat_id"] == "secondary-home"

@@ -52,7 +52,8 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from gateway.platforms.base import MessageEvent, MessageType, SessionSource
+from gateway.platforms.base import SessionSource
+from gateway.platforms.event import MessageEvent, MessageType
 
 
 # ---------------------------------------------------------------------------
@@ -93,11 +94,28 @@ class TestVoiceCloneCommand:
 
         event = SimpleNamespace(media_urls=["speaker.wav", "notes.txt"], media_types=None)
 
-        assert has_voiceclone_intent("Please clone this speaker voice")
-        assert not has_voiceclone_intent("Please summarize the attached audio")
+        assert has_voiceclone_intent("Clone this speaker's voice") is True
+        assert has_voiceclone_intent("summarize the attached audio") is False
+        assert has_voiceclone_intent("create a transcript of the speaker in this video") is False
+        assert has_voiceclone_intent("make subtitles for the voice in this clip") is False
         assert voiceclone_media_paths(event) == [("speaker.wav", "")]
         assert parse_voiceclone_args('Hayden --target "01:23"') == ("Hayden", "01:23")
         assert resolve_command("voice-clone").name == "voiceclone"
+
+    @pytest.mark.asyncio
+    async def test_natural_language_voice_clone_request_routes_before_agent_turn(self, tmp_path):
+        runner = _make_runner(tmp_path)
+        runner._handle_voiceclone_command = AsyncMock(return_value="opened locally")
+        event = _make_event("Please clone this speaker voice")
+        event.media_urls = ["speaker.wav"]
+        event.media_types = ["audio/wav"]
+
+        handled, result = await runner._hm_dispatch_idle_commands(
+            event, event.source, "agent:main:telegram:group:123:user1")
+
+        assert handled is True
+        assert result == "opened locally"
+        runner._handle_voiceclone_command.assert_awaited_once_with(event)
 
     @pytest.mark.asyncio
     async def test_no_media_creates_inactive_effect_draft(self, tmp_path, monkeypatch):
@@ -120,6 +138,31 @@ class TestVoiceCloneCommand:
         assert draft["target_selection"]["state"] == "needs_media"
         assert "inactive" in result.lower()
         assert not (tmp_path / "config.yaml").exists()
+
+    @pytest.mark.asyncio
+    async def test_media_curation_runs_off_the_gateway_event_loop(self, tmp_path, monkeypatch):
+        from tools import voice_clone_workspace as workspace
+
+        loop_thread = threading.get_ident()
+
+        def fake_create(*_args, **_kwargs):
+            assert threading.get_ident() != loop_thread
+            return {"id": "workspace-1", "status": "ready", "samples": []}
+
+        monkeypatch.setattr(workspace, "create_voice_clone_workspace", fake_create)
+        runner = _make_runner(tmp_path)
+        event = _make_event("/voiceclone Hayden")
+        event.media_urls = ["speaker.wav"]
+        event.media_types = ["audio/wav"]
+        runner._thread_metadata_for_source = lambda _source: {}
+        runner._session_key_for_source = lambda _source: "agent:main:telegram:group:123:user1"
+        adapter = SimpleNamespace(send_voice_clone_panel=AsyncMock(return_value=SimpleNamespace(success=True)))
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_voiceclone_command(event)
+
+        assert "generated locally" in result.lower()
+        adapter.send_voice_clone_panel.assert_awaited_once()
 
 
 # =====================================================================
@@ -437,7 +480,7 @@ class TestSendVoiceReply:
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
         with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result) as mock_tts, \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_text_normalize._strip_markdown_for_tts", side_effect=lambda t: t), \
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
@@ -465,7 +508,7 @@ class TestSendVoiceReply:
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
         with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_text_normalize._strip_markdown_for_tts", side_effect=lambda t: t), \
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
@@ -761,6 +804,44 @@ class TestVoiceChannelCommands:
         assert event.source.chat_type == "channel"
 
     @pytest.mark.asyncio
+    async def test_input_reroutes_speaker_without_changing_transport_owner(self, runner, monkeypatch):
+        from gateway.config import Platform
+        from gateway.profile_routing import parse_profile_routes
+
+        runner.config = SimpleNamespace(
+            multiplex_profiles=True,
+            profile_routes=parse_profile_routes([
+                {"name": "second", "platform": "discord", "bot_profile": "team-bot",
+                 "user_id": "222", "profile": "second"},
+            ]),
+        )
+        monkeypatch.setattr(
+            "gateway.run._multiplex_profile_homes",
+            lambda _config: [("team-bot", None), ("first", None), ("second", None)],
+        )
+        mock_adapter = AsyncMock()
+        mock_adapter._owner_profile = "team-bot"
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {111: SessionSource(
+            platform=Platform.DISCORD, chat_id="123", chat_type="channel",
+            user_id="111", profile="first",
+        ).to_dict()}
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters = {}
+        runner._profile_adapters = {
+            "team-bot": {Platform.DISCORD: mock_adapter},
+            "second": {},
+        }
+
+        await runner._handle_voice_channel_input(111, 222, "Hello from VC", adapter=mock_adapter)
+
+        source = mock_adapter.handle_message.call_args[0][0].source
+        assert (source.user_id, source.profile) == ("222", "second")
+        assert runner._transport_owner(source) == (mock_adapter, "team-bot")
+
+    @pytest.mark.asyncio
     async def test_input_resolves_channel_prompt(self, runner):
         """Voice input must carry the bound text channel's channel_prompt (#50149)."""
         from gateway.config import Platform
@@ -1005,8 +1086,9 @@ class TestDiscordVoiceChannelMethods:
         runner._running_agents["agent:main:discord:group:999:42"] = object()
         runner._running_agents["agent:coder:discord:group:777:42"] = object()
 
-        assert runner._is_discord_voice_chat_busy("999") is True
-        assert runner._is_discord_voice_chat_busy("777") is True
+        assert runner._is_discord_voice_chat_busy("999", profile="default") is True
+        assert runner._is_discord_voice_chat_busy("777", profile="coder") is True
+        assert runner._is_discord_voice_chat_busy("777", profile="default") is False
         assert runner._is_discord_voice_chat_busy("998") is False
 
     @pytest.mark.asyncio
@@ -1213,7 +1295,7 @@ class TestStreamTtsToSpeaker:
 
     def test_none_sentinel_flushes_buffer(self):
         """None sentinel causes remaining buffer to be spoken."""
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
         text_q = queue.Queue()
         stop_evt = threading.Event()
         done_evt = threading.Event()
@@ -1231,7 +1313,7 @@ class TestStreamTtsToSpeaker:
 
     def test_stop_event_aborts_early(self):
         """Setting stop_event causes early exit."""
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
         text_q = queue.Queue()
         stop_evt = threading.Event()
         done_evt = threading.Event()
@@ -1247,7 +1329,7 @@ class TestStreamTtsToSpeaker:
 
     def test_done_event_set_on_exception(self):
         """tts_done_event is set even when an exception occurs."""
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
         text_q = queue.Queue()
         stop_evt = threading.Event()
         done_evt = threading.Event()
@@ -1390,13 +1472,13 @@ class TestSendVoiceReplyFilename:
         the uniqueness contract lives there now.
         """
         import inspect
-        from gateway.platforms.base import build_auto_tts_output_path
+        from gateway.audio_retention import build_generated_audio_path
         from gateway.run import GatewayRunner
-        source = inspect.getsource(build_auto_tts_output_path)
+        source = inspect.getsource(build_generated_audio_path)
         assert "uuid" in source, \
-            "build_auto_tts_output_path should use uuid for unique filenames"
+            "build_generated_audio_path should use uuid for unique filenames"
         assert "int(time.time())" not in source, \
-            "build_auto_tts_output_path should not use int(time.time()) — collision risk"
+            "build_generated_audio_path should not rely on timestamps alone — collision risk"
         runner_source = inspect.getsource(GatewayRunner._send_voice_reply)
         assert "build_auto_tts_output_path" in runner_source, \
             "_send_voice_reply should build its path via build_auto_tts_output_path"
@@ -1569,27 +1651,27 @@ class TestSendVoiceReplyCleanup:
         tree = ast.parse(source)
         func = tree.body[0]
 
-        has_finally_unlink = False
+        has_finally_retention = False
         for node in ast.walk(func):
             if isinstance(node, ast.Try) and node.finalbody:
-                finally_source = ast.dump(node.finalbody[0])
-                if "unlink" in finally_source or "remove" in finally_source:
-                    has_finally_unlink = True
+                finally_source = "\n".join(ast.dump(statement) for statement in node.finalbody)
+                if "finalize_generated_audio" in finally_source:
+                    has_finally_retention = True
                     break
 
-        assert has_finally_unlink, \
-            "_send_voice_reply must have os.unlink in a finally block"
+        assert has_finally_retention, \
+            "_send_voice_reply must finalize retention in a finally block"
 
 
 # =====================================================================
-# Bug 8: Base adapter auto-TTS cleans up temp file after play_tts
+# Base adapter auto-TTS finalizes configured retention after play_tts
 # =====================================================================
 
 class TestAutoTtsTempFileCleanup:
-    """Base adapter auto-TTS must clean up generated audio file."""
+    """Base adapter auto-TTS must finalize generated-audio retention."""
 
-    def test_source_has_finally_remove(self):
-        """play_tts call is wrapped in try/finally with os.remove."""
+    def test_source_has_finally_retention(self):
+        """play_tts call is wrapped in try/finally with retention finalization."""
         import inspect
         from gateway.platforms.base import BasePlatformAdapter
         source = inspect.getsource(BasePlatformAdapter._process_message_background)
@@ -1598,10 +1680,10 @@ class TestAutoTtsTempFileCleanup:
         assert play_tts_idx > 0
         after_play = source[play_tts_idx:]
         finally_idx = after_play.find("finally")
-        remove_idx = after_play.find("os.remove")
+        finalize_idx = after_play.find("finalize_generated_audio")
         assert finally_idx > 0, "play_tts must be in a try/finally block"
-        assert remove_idx > 0, "finally block must call os.remove on _tts_path"
-        assert remove_idx > finally_idx, "os.remove must be inside the finally block"
+        assert finalize_idx > 0, "finally block must finalize generated audio"
+        assert finalize_idx > finally_idx, "retention finalization must be inside the finally block"
 
 
 # =====================================================================
@@ -1933,7 +2015,8 @@ class TestVoiceTTSPlayback:
 
     def _call_should_reply(self, runner, voice_mode, msg_type, response="Hello",
                            agent_msgs=None, already_sent=False):
-        from gateway.platforms.base import MessageEvent, SessionSource
+        from gateway.platforms.base import SessionSource
+        from gateway.platforms.event import MessageEvent
         from gateway.config import Platform
         runner._voice_mode["discord:ch1"] = voice_mode
         source = SessionSource(
@@ -1949,7 +2032,7 @@ class TestVoiceTTSPlayback:
 
     def test_voice_input_runner_skips(self):
         """Streaming OFF + voice input: runner skips — base adapter handles."""
-        from gateway.platforms.base import MessageType
+        from gateway.platforms.event import MessageType
         runner = self._make_runner()
         from gateway.config import Platform
         adapter = MagicMock()
@@ -1959,14 +2042,14 @@ class TestVoiceTTSPlayback:
 
     def test_text_input_voice_all_runner_fires(self):
         """Streaming OFF + text input + voice_mode=all: runner generates TTS."""
-        from gateway.platforms.base import MessageType
+        from gateway.platforms.event import MessageType
         runner = self._make_runner()
         assert self._call_should_reply(runner, "all", MessageType.TEXT, already_sent=False) is True
 
 
     def test_error_response_no_tts(self):
         """Error response: no TTS regardless of voice_mode."""
-        from gateway.platforms.base import MessageType
+        from gateway.platforms.event import MessageType
         runner = self._make_runner()
         assert self._call_should_reply(runner, "all", MessageType.TEXT, response="Error: boom") is False
 
@@ -1976,7 +2059,7 @@ class TestVoiceTTSPlayback:
 
     def test_streaming_on_agent_tts_dedup(self):
         """Streaming ON + agent called TTS: runner skips (dedup still works)."""
-        from gateway.platforms.base import MessageType
+        from gateway.platforms.event import MessageType
         runner = self._make_runner()
         agent_msgs = [{"role": "assistant", "tool_calls": [
             {"id": "1", "type": "function", "function": {"name": "text_to_speech", "arguments": "{}"}}
@@ -2100,7 +2183,7 @@ class TestStreamTtsTempfileFallback:
         import wave
         import tools.tts_tool as tts_mod
         import tools.voice_mode as vm
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
 
         # Fake registry streamer so resolve_streaming_provider yields chunked
         # PCM regardless of which real providers are configured in the env.

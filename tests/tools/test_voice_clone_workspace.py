@@ -50,6 +50,8 @@ def test_workspace_candidate_selection_and_workspace_preset(workspace_home):
         "created_at": 10,
     }
     workspace.save_workspace(ws)
+    overlapping = dict(ws, id="w2", chat_key="agent:main:discord:group:chat-1234:user-1", created_at=20)
+    workspace.save_workspace(overlapping)
 
     assert workspace.latest_workspace_for_chat("chat-123")["id"] == "w1"
 

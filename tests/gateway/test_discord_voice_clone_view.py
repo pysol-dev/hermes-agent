@@ -88,3 +88,55 @@ async def test_voice_clone_view_rejects_unauthorized_page_change(tmp_path, monke
     assert view.effects_page == 0
     interaction.response.send_message.assert_awaited_once()
     interaction.response.edit_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_voice_clone_callback_restores_bound_profile_home_a_b_a(tmp_path, monkeypatch):
+    from gateway.run import _profile_runtime_scope
+    from hermes_constants import get_hermes_home
+    from plugins.platforms.discord import adapter as discord_adapter
+    from tools import voice_clone_workspace
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    workspace_id = "voiceclone-profile-scope"
+    with _profile_runtime_scope(profile_b, {}, hydrate_secrets=False):
+        save_workspace(
+            {
+                "id": workspace_id,
+                "chat_key": "agent:secondary:discord:group:123:user-1",
+                "voice_name": "profile-scope",
+                "source_candidates": [{"index": 1}],
+                "selected_source_candidate": 1,
+                "samples": [{"index": 1, "ok": True, "path": "/tmp/sample.mp3"}],
+                "selected_candidates": [1],
+                "effect_state": {"pitch": 9},
+            }
+        )
+        view = VoiceCloneEffectsView(
+            allowed_user_ids={"123"}, workspace_id=workspace_id,
+            profile_home=str(profile_b),
+        )
+
+    observed_homes = []
+    original_reset = voice_clone_workspace.reset_workspace_effects
+
+    def recording_reset(value):
+        observed_homes.append(str(get_hermes_home()))
+        return original_reset(value)
+
+    monkeypatch.setattr(voice_clone_workspace, "reset_workspace_effects", recording_reset)
+    discord_color = getattr(discord_adapter.discord, "Color")
+    monkeypatch.setattr(discord_color, "blurple", lambda: None, raising=False)
+    interaction = _interaction(123)
+    with _profile_runtime_scope(profile_a, {}, hydrate_secrets=False):
+        assert str(get_hermes_home()) == str(profile_a)
+        await _button(view, f"vcreset:{workspace_id}").callback(interaction)
+        assert str(get_hermes_home()) == str(profile_a)
+
+    assert observed_homes == [str(profile_b)]
+    interaction.response.edit_message.assert_awaited_once()
+    with _profile_runtime_scope(profile_b, {}, hydrate_secrets=False):
+        assert voice_clone_workspace.load_workspace(workspace_id)["effect_state"]["pitch"] != 9

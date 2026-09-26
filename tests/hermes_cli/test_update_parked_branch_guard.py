@@ -26,6 +26,8 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import main as hermes_main
+import hermes_cli.main_web_build as main_web_build
+import hermes_cli.main_install_repair as main_install_repair
 from hermes_cli import update_cmd
 
 
@@ -251,16 +253,18 @@ def _patch_update_flow(monkeypatch, repo, run_real_git=True):
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", repo)
     monkeypatch.setattr(hermes_main, "_resolve_update_branch", lambda args: "main")
     monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+    monkeypatch.setattr(main_install_repair, "_is_windows", lambda: False)
     monkeypatch.setattr(
         hermes_main, "_get_origin_url",
         lambda *a, **k: "https://github.com/NousResearch/hermes-agent.git",
     )
-    monkeypatch.setattr(hermes_main, "_is_fork", lambda *a, **k: False)
-    monkeypatch.setattr(hermes_main, "_discard_lockfile_churn", lambda *a, **k: None)
+    monkeypatch.setattr(update_cmd, "_is_fork", lambda *a, **k: False)
+    monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *a, **k: None)
     monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *a, **k: None)
     monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *a, **k: None)
     monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda *a, **k: 0)
     monkeypatch.setattr(hermes_main, "_record_bytecode_fingerprint", lambda *a, **k: None)
+    monkeypatch.setattr(main_web_build, "_record_bytecode_fingerprint", lambda *a, **k: None)
     monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda *a, **k: None)
     monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: None)
     monkeypatch.setattr(
@@ -483,6 +487,34 @@ def test_rejected_in_place_push_rolls_back_local_branch(repo_pair, capsys):
     )
     assert _git(repo_pair, "rev-parse", "HEAD").stdout.strip() == pre_update
     assert not (repo_pair / "local.txt").exists()
+    assert "the local update was rolled back" in capsys.readouterr().out
+
+
+def test_missing_tracking_branch_rolls_back_local_update(repo_pair, capsys):
+    pre_update = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    _git(repo_pair, "branch", "--unset-upstream", check=False)
+    (repo_pair / "local.txt").write_text("local merged update\n")
+    _git(repo_pair, "add", "local.txt")
+    _git(repo_pair, "commit", "-qm", "local update")
+
+    assert not update_cmd._push_in_place_branch_or_rollback(
+        GIT, repo_pair, "old-feature", pre_update
+    )
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout.strip() == pre_update
+    assert "the local update was rolled back" in capsys.readouterr().out
+
+
+def test_official_origin_tracking_branch_rolls_back_local_update(repo_pair, capsys):
+    pre_update = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    _git(repo_pair, "branch", "--set-upstream-to=origin/main", "old-feature")
+    (repo_pair / "local.txt").write_text("local merged update\n")
+    _git(repo_pair, "add", "local.txt")
+    _git(repo_pair, "commit", "-qm", "local update")
+
+    assert not update_cmd._push_in_place_branch_or_rollback(
+        GIT, repo_pair, "old-feature", pre_update
+    )
+    assert _git(repo_pair, "rev-parse", "HEAD").stdout.strip() == pre_update
     assert "the local update was rolled back" in capsys.readouterr().out
 
 

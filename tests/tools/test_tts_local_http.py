@@ -30,7 +30,7 @@ class _Response:
 
 def test_local_http_posts_openai_compatible_payload(tmp_path, monkeypatch):
     out = tmp_path / "speech.mp3"
-    post = Mock(return_value=_Response(b"audio-bytes"))
+    post = Mock(return_value=_Response(b"ID3audio-bytes"))
     monkeypatch.setattr("requests.post", post)
 
     cfg = {
@@ -44,7 +44,7 @@ def test_local_http_posts_openai_compatible_payload(tmp_path, monkeypatch):
     }
 
     assert tts_tool._generate_local_http_tts("hello", str(out), cfg) == str(out)
-    assert out.read_bytes() == b"audio-bytes"
+    assert out.read_bytes() == b"ID3audio-bytes"
     post.assert_called_once()
     args, kwargs = post.call_args
     assert args == ("http://127.0.0.1:8020/v1/audio/speech",)
@@ -58,11 +58,12 @@ def test_local_http_posts_openai_compatible_payload(tmp_path, monkeypatch):
     }
     assert kwargs["headers"]["Accept"] == "audio/*"
     assert kwargs["timeout"] == 120
+    assert kwargs["stream"] is True
 
 
 def test_local_http_uses_endpoint_and_auth(tmp_path, monkeypatch):
     out = tmp_path / "speech.ogg"
-    post = Mock(return_value=_Response(b"opus", content_type="audio/ogg"))
+    post = Mock(return_value=_Response(b"OggSopus", content_type="audio/ogg"))
     monkeypatch.setattr("requests.post", post)
 
     cfg = {
@@ -78,6 +79,22 @@ def test_local_http_uses_endpoint_and_auth(tmp_path, monkeypatch):
     assert args == ("http://localhost:9000/speak",)
     assert kwargs["json"]["response_format"] == "opus"
     assert kwargs["headers"]["Authorization"] == "Bearer secret-token"
+
+
+@pytest.mark.parametrize(
+    ("content", "content_type"),
+    [(b'{"error":"sidecar failed"}', "application/json"), (b"<html>bad gateway</html>", "text/html"),
+     (b"not-audio", "audio/mpeg")],
+)
+def test_local_http_rejects_success_status_with_non_audio_body(tmp_path, monkeypatch, content, content_type):
+    out = tmp_path / "speech.mp3"
+    monkeypatch.setattr(
+        "requests.post", Mock(return_value=_Response(content, content_type=content_type)))
+
+    with pytest.raises(RuntimeError, match="non-audio content"):
+        tts_tool._generate_local_http_tts("hello", str(out), {"local_http": {}})
+
+    assert not out.exists()
 
 
 def test_text_to_speech_dispatches_local_http_not_edge(tmp_path, monkeypatch):
