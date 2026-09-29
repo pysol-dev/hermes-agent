@@ -1,6 +1,6 @@
 ---
 name: telegram-troubleshooting
-description: Use when diagnosing Hermes Telegram adapter failures, delivery issues, or connectivity problems.
+description: Diagnose Hermes Telegram delivery and connection failures.
 version: 2.0.0
 author: Hermes Agent
 license: MIT

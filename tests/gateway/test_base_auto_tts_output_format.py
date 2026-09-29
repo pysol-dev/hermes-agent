@@ -12,6 +12,7 @@ voice bubble). The fix passes an explicit output path from
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -26,7 +27,6 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
-from tools.tts_tool import OPUS_VOICE_PLATFORMS
 
 
 class _DummyAdapter(BasePlatformAdapter):
@@ -91,7 +91,7 @@ def test_output_path_is_mp3_for_non_opus_platforms(platform):
 # Base-adapter auto-TTS block: explicit output_path, no contextvar reliance
 # ---------------------------------------------------------------------------
 
-async def _run_auto_tts(adapter: _DummyAdapter, platform: Platform):
+async def _run_auto_tts(adapter: _DummyAdapter, platform: Platform, expected_secret=None):
     adapter._keep_typing = _hold_typing()
     adapter._should_auto_tts_for_chat = lambda _chat_id: True
     adapter.play_tts = AsyncMock(return_value=SendResult(success=True, message_id="tts-1"))
@@ -101,8 +101,11 @@ async def _run_auto_tts(adapter: _DummyAdapter, platform: Platform):
     requested = []
 
     def fake_tts(*, text, output_path=None):
+        assert output_path is not None
+        if expected_secret is not None:
+            from tools.tool_backend_helpers import resolve_provider_secret
+            assert resolve_provider_secret("ELEVENLABS_API_KEY", "elevenlabs") == expected_secret
         requested.append(output_path)
-        from pathlib import Path
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         Path(output_path).write_bytes(b"fake audio")
         return json.dumps({"success": True, "file_path": output_path})
@@ -110,9 +113,8 @@ async def _run_auto_tts(adapter: _DummyAdapter, platform: Platform):
     with patch("tools.tts_tool.check_tts_requirements", return_value=True), patch(
         "tools.tts_tool.text_to_speech_tool", side_effect=fake_tts
     ):
-        await adapter._process_message_background(
-            event, build_session_key(event.source)
-        )
+        await adapter._process_message_background(event, build_session_key(event.source))
+    adapter.play_tts.assert_awaited_once()
     return requested, adapter
 
 
@@ -125,13 +127,19 @@ async def test_base_auto_tts_uses_routed_profile_home_and_restores_outer_scope(t
     profile_b = tmp_path / "profile-b"
     profile_a.mkdir()
     profile_b.mkdir()
+    @asynccontextmanager
+    async def routed_scope(_source):
+        with _profile_runtime_scope(profile_b, {"ELEVENLABS_API_KEY": "profile-b-test"}, hydrate_secrets=False):
+            yield
+
     adapter = _DummyAdapter(Platform.TELEGRAM)
     adapter.gateway_runner = SimpleNamespace(  # type: ignore[assignment]
+        _async_profile_scope_for_source=routed_scope,
         _media_delivery_scope_for_source=lambda _source: _profile_runtime_scope(
             profile_b, {}, hydrate_secrets=False))
 
     with _profile_runtime_scope(profile_a, {}, hydrate_secrets=False):
-        requested, _adapter = await _run_auto_tts(adapter, Platform.TELEGRAM)
+        requested, _adapter = await _run_auto_tts(adapter, Platform.TELEGRAM, expected_secret="profile-b-test")
         assert str(get_hermes_home()) == str(profile_a)
 
     assert len(requested) == 1

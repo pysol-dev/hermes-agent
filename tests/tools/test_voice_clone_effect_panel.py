@@ -1,6 +1,6 @@
 import json
 
-import yaml
+import hermes_yaml as yaml
 
 from tools import voice_clone_effect_panel as panel
 

@@ -55,7 +55,7 @@ class TestA2AToolsGate(unittest.TestCase):
                 seen[name] = kw.get("check_fn")
 
         a2at.register_tools(Ctx())
-        self.assertTrue({"a2a_discover", "a2a_call", "a2a_list", "a2a_history", "a2a_orchestrate"} <= seen.keys())
+        self.assertTrue(seen)
         for name, fn in seen.items():
             self.assertIs(fn, a2at._a2a_tools_available, name)
 

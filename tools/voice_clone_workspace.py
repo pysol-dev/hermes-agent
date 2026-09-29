@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
-import yaml
+from hermes_cli.config import load_config_readonly
 
 try:
     from hermes_constants import get_hermes_home
@@ -83,8 +83,7 @@ def latest_workspace_for_chat(chat_key: str) -> Dict[str, Any] | None:
 
 
 def _load_tts_config() -> Dict[str, Any]:
-    cfg_path = get_hermes_home() / "config.yaml"
-    cfg = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
+    cfg = load_config_readonly()
     return (cfg or {}).get("tts", {}) or {}
 
 

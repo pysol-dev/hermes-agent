@@ -71,12 +71,12 @@ def media_kind(path: str | Path, mime_type: str | None = None) -> str:
 
 
 def _run_json(cmd: list[str], *, timeout: int) -> Dict[str, Any]:
-    proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    proc = subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
     return json.loads(proc.stdout or "{}")
 
 
 def _run_ffmpeg(cmd: list[str], *, timeout: int = FFMPEG_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    return subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
 
 
 def ffprobe_inventory(path: str | Path) -> Dict[str, Any]:

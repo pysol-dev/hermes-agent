@@ -1,6 +1,6 @@
 ---
 name: telegram-bot-behavior
-description: Use when understanding Telegram bot delivery mechanics for Hermes groups and DMs.
+description: Explain Telegram bot delivery in groups and DMs.
 version: 1.0.0
 author: Hermes Agent
 license: MIT

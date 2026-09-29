@@ -12,7 +12,7 @@ from typing import Dict, Iterable, List, Tuple
 import json
 import time
 
-import yaml
+from hermes_cli.config import load_config_readonly
 
 try:
     from hermes_constants import get_hermes_home
@@ -78,8 +78,7 @@ def _hermes_config_path() -> Path:
 
 
 def current_local_http_voice() -> Tuple[str, Path]:
-    cfg_path = _hermes_config_path()
-    cfg = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
+    cfg = load_config_readonly()
     tts = (cfg or {}).get("tts", {}) or {}
     local_http = (tts.get("local_http", {}) or {})
     extra = (local_http.get("extra_body", {}) or {})

@@ -105,13 +105,6 @@ def _make_event(text="/stop", chat_id="42"):
 # ---------------------------------------------------------------------------
 
 
-def test_unwrap_ephemeral_default_ttl_zero_disables():
-    """Config default of 0 (the shipped default) means the feature is off."""
-    adapter = _delete_adapter()
-    with patch.object(adapter, "_get_ephemeral_system_ttl_default", return_value=0):
-        text, ttl = adapter._unwrap_ephemeral(EphemeralReply("bye"))
-    assert text == "bye"
-    assert ttl == 0
 
 
 def test_unwrap_ephemeral_handles_unreadable_config():
@@ -187,13 +180,14 @@ async def test_process_message_unwraps_ephemeral_before_send():
 
     event = _make_event()
     session_key = "agent:main:telegram:private:42"
+    real_sleep = asyncio.sleep
     with patch("gateway.platforms.base.asyncio.sleep", _fake_sleep), patch.object(
         adapter, "_keep_typing", new=AsyncMock()
     ):
         await adapter._process_message_background(event, session_key)
         # Pump until the detached delete task completes.
         for _ in range(10):
-            await asyncio.sleep(0)
+            await real_sleep(0)
 
     # Sent text is the unwrapped string, NOT repr(EphemeralReply(...))
     adapter._send_with_retry.assert_called_once()

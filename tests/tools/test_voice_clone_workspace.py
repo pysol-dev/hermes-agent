@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from tools import voice_clone_curation as curation
 from tools import voice_clone_workspace as workspace
@@ -10,6 +10,7 @@ from tools import voice_clone_workspace as workspace
 
 @pytest.fixture
 def workspace_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(curation, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(workspace, "get_hermes_home", lambda: tmp_path)
     return tmp_path
